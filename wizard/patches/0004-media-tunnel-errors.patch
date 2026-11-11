@@ -1,0 +1,343 @@
+Subject: Report empty media tunnels and add opt-in VISIONOS
+
+Adapted from https://github.com/imputnet/cobalt/pull/1581
+
+diff --git a/api/package.json b/api/package.json
+index 3166ba790eae71d10874dec8798b86d575921d7a..2e1ce91b1c6426a1a26cbb157e20b83653c6a810 100644
+--- a/api/package.json
++++ b/api/package.json
+@@ -6,7 +6,7 @@
+     "exports": "./src/cobalt.js",
+     "type": "module",
+     "engines": {
+-        "node": ">=18.17"
++        "node": ">=20"
+     },
+     "scripts": {
+         "start": "node src/cobalt",
+@@ -40,7 +40,7 @@
+         "set-cookie-parser": "2.7.2",
+         "undici": "^6.24.1",
+         "url-pattern": "1.0.3",
+-        "youtubei.js": "17.0.1",
++        "youtubei.js": "18.1.0",
+         "zod": "^4.2.1"
+     },
+     "optionalDependencies": {
+diff --git a/api/src/processing/services/youtube.js b/api/src/processing/services/youtube.js
+index 553859714061f1e6a39359d8c9607462a31e564d..8d2f457a9b18a02f9532810029cdcb76b05398d7 100644
+--- a/api/src/processing/services/youtube.js
++++ b/api/src/processing/services/youtube.js
+@@ -23,7 +23,6 @@ Platform.shim.eval = async (data) => {
+ }
+ 
+ const PLAYER_REFRESH_PERIOD = 1000 * 60 * 15; // ms
+-
+ let innertube, lastRefreshedAt;
+ 
+ const codecList = {
+@@ -57,7 +56,10 @@ const hlsCodecList = {
+     }
+ }
+ 
+-const clientsWithNoCipher = ['IOS', 'ANDROID', 'YTSTUDIO_ANDROID', 'YTMUSIC_ANDROID'];
++const clientsWithNoCipher = [
++    'IOS', 'ANDROID', 'ANDROID_VR', 'VISIONOS',
++    'YTSTUDIO_ANDROID', 'YTMUSIC_ANDROID'
++];
+ 
+ const videoQualities = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320];
+ 
+diff --git a/api/src/stream/ffmpeg.js b/api/src/stream/ffmpeg.js
+index c3372eb8291eac7b0dcdbb331ca28fae8929f3a7..3c41d40c9ee996726ae30e05c94fa56c70756833 100644
+--- a/api/src/stream/ffmpeg.js
++++ b/api/src/stream/ffmpeg.js
+@@ -57,11 +57,21 @@ const getCommand = (args) => {
+ const render = async (res, streamInfo, ffargs, estimateMultiplier) => {
+     let process;
+     const urls = Array.isArray(streamInfo.urls) ? streamInfo.urls : [streamInfo.urls];
+-    const shutdown = () => (
+-        killProcess(process),
+-        closeResponse(res),
+-        urls.map(destroyInternalStream)
+-    );
++    let stopped = false;
++    const shutdown = () => {
++        if (stopped) return;
++        stopped = true;
++        killProcess(process);
++        if (!res.destroyed) {
++            if (!res.headersSent) {
++                res.removeHeader('Content-Disposition');
++                res.removeHeader('Estimated-Content-Length');
++            }
++            closeResponse(res);
++        }
++        urls.forEach(destroyInternalStream);
++    };
++    res.once('close', shutdown);
+ 
+     try {
+         const args = [
+@@ -77,20 +87,20 @@ const render = async (res, streamInfo, ffargs, estimateMultiplier) => {
+             ],
+         });
+ 
++        process.once('error', shutdown);
+         const [,,, muxOutput] = process.stdio;
+ 
+         res.setHeader('Connection', 'keep-alive');
+         res.setHeader('Content-Disposition', contentDisposition(streamInfo.filename));
+ 
+-        res.setHeader(
+-            'Estimated-Content-Length',
+-            await estimateTunnelLength(streamInfo, estimateMultiplier)
+-        );
++        const estimatedLength = await estimateTunnelLength(streamInfo, estimateMultiplier);
++        if (stopped) return;
++        res.setHeader('Estimated-Content-Length', estimatedLength);
+ 
+-        pipe(muxOutput, res, shutdown);
++        // Keep the response open until shutdown can report an empty ffmpeg output as an error.
++        pipe(muxOutput, res, shutdown, { end: false });
+ 
+-        process.on('close', shutdown);
+-        res.on('finish', shutdown);
++        process.once('close', shutdown);
+     } catch {
+         shutdown();
+     }
+diff --git a/api/src/stream/internal.js b/api/src/stream/internal.js
+index f87896aa25407b1c63e143dc46c3d8845e79f0ad..1346594d870416ef19c86d7cab18e7704d154de6 100644
+--- a/api/src/stream/internal.js
++++ b/api/src/stream/internal.js
+@@ -1,6 +1,6 @@
+ import { request } from "undici";
+ import { Readable } from "node:stream";
+-import { closeRequest, getHeaders, pipe } from "./shared.js";
++import { closeRequest, closeResponse, getHeaders, pipe } from "./shared.js";
+ import { handleHlsPlaylist, isHlsResponse, probeInternalHLSTunnel } from "./internal-hls.js";
+ 
+ const CHUNK_SIZE = BigInt(8e6); // 8 MB
+@@ -9,37 +9,48 @@ const min = (a, b) => a < b ? a : b;
+ const serviceNeedsChunks = new Set(["youtube", "vk"]);
+ 
+ async function* readChunks(streamInfo, size) {
+-    let read = 0n, chunksSinceTransplant = 0;
++    let read = 0n;
+     while (read < size) {
+         if (streamInfo.controller.signal.aborted) {
+             throw new Error("controller aborted");
+         }
+ 
+-        const chunk = await request(streamInfo.url, {
+-            headers: {
+-                ...getHeaders(streamInfo.service),
+-                Range: `bytes=${read}-${read + CHUNK_SIZE}`
+-            },
+-            dispatcher: streamInfo.dispatcher,
+-            signal: streamInfo.controller.signal,
+-            maxRedirections: 4
+-        });
++        const end = min(read + CHUNK_SIZE, size) - 1n;
++        let chunk, attempts = 0;
++        while (true) {
++            chunk = await request(streamInfo.url, {
++                headers: {
++                    ...getHeaders(streamInfo.service),
++                    Range: `bytes=${read}-${end}`
++                },
++                dispatcher: streamInfo.dispatcher,
++                signal: streamInfo.controller.signal,
++                maxRedirections: 4
++            });
+ 
+-        if (chunk.statusCode === 403 && chunksSinceTransplant >= 3 && streamInfo.transplant) {
+-            chunksSinceTransplant = 0;
+-            try {
++            if (chunk.statusCode === 403 && streamInfo.transplant && attempts++ < 3) {
++                await chunk.body.dump();
+                 await streamInfo.transplant(streamInfo.dispatcher);
+                 continue;
+-            } catch {}
+-        }
++            }
+ 
+-        chunksSinceTransplant++;
++            if (chunk.statusCode !== 200 && chunk.statusCode !== 206) {
++                await chunk.body.dump();
++                throw new Error(`media request failed with status ${chunk.statusCode}`);
++            }
+ 
+-        const expected = min(CHUNK_SIZE, size - read);
+-        const received = BigInt(chunk.headers['content-length']);
++            break;
++        }
+ 
+-        if (received < expected / 2n) {
+-            closeRequest(streamInfo.controller);
++        const expected = min(CHUNK_SIZE, size - read);
++        const received = BigInt(chunk.headers['content-length'] ?? 0);
++
++        // A source that ignores Range may only send a full body on the first request.
++        if (!received || (chunk.statusCode === 200
++            ? read !== 0n || received !== size
++            : received > expected)) {
++            await chunk.body.dump();
++            throw new Error("unexpected media response length");
+         }
+ 
+         for await (const data of chunk.body) {
+@@ -52,11 +63,18 @@ async function* readChunks(streamInfo, size) {
+ 
+ async function handleChunkedStream(streamInfo, res) {
+     const { signal } = streamInfo.controller;
+-    const cleanup = () => (res.end(), closeRequest(streamInfo.controller));
++    const cleanup = () => {
++        if (!res.headersSent) {
++            res.removeHeader('content-length');
++            res.removeHeader('content-type');
++        }
++        if (!res.destroyed) closeResponse(res);
++        closeRequest(streamInfo.controller);
++    };
+ 
+     try {
+-        let req, attempts = 3;
+-        while (attempts--) {
++        let req;
++        for (let attempts = 0; ; attempts++) {
+             req = await fetch(streamInfo.url, {
+                 headers: getHeaders(streamInfo.service),
+                 method: 'HEAD',
+@@ -65,13 +83,8 @@ async function handleChunkedStream(streamInfo, res) {
+             });
+ 
+             streamInfo.url = req.url;
+-            if (req.status === 403 && streamInfo.transplant) {
+-                try {
+-                    await streamInfo.transplant(streamInfo.dispatcher);
+-                } catch {
+-                    break;
+-                }
+-            } else break;
++            if (req.status !== 403 || !streamInfo.transplant || attempts >= 3) break;
++            await streamInfo.transplant(streamInfo.dispatcher);
+         }
+ 
+         const size = BigInt(req.headers.get('content-length'));
+diff --git a/api/src/stream/shared.js b/api/src/stream/shared.js
+index 6d2685641a4d3ed0e6ea83c677a02ca3560dff45..3d71ab2a019ba71ad12a5c43481232b2b0cb2d16 100644
+--- a/api/src/stream/shared.js
++++ b/api/src/stream/shared.js
+@@ -43,14 +43,14 @@ export function getHeaders(service) {
+         .reduce((p, [key, val]) => ({ ...p, [key]: String(val) }), {})
+ }
+ 
+-export function pipe(from, to, done) {
++export function pipe(from, to, done, options) {
+     from.on('error', done)
+         .on('close', done);
+ 
+     to.on('error', done)
+       .on('close', done);
+ 
+-    from.pipe(to);
++    from.pipe(to, options);
+ }
+ 
+ export async function estimateTunnelLength(streamInfo, multiplier = 1.1) {
+diff --git a/docs/api-env-variables.md b/docs/api-env-variables.md
+index 113b667ed1886664a3ccc3eef93c9f7a74eba4cd..2eb2719813998020587be62220f733e3ed105665 100644
+--- a/docs/api-env-variables.md
++++ b/docs/api-env-variables.md
+@@ -260,6 +260,8 @@ the value is a number, either `0` or `1`.
+ ### CUSTOM_INNERTUBE_CLIENT
+ innertube client that will be used instead of the default one.
+ 
++`VISIONOS` is available as an alternative for videos whose media URLs are rejected with the default client. It does not work for every video (for example, made-for-kids videos). The default remains `IOS`.
++
+ the value is a string.
+ 
+ ### YOUTUBE_SESSION_SERVER
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 405d37fb20f601509dacdcbedd3a3bbbcff8fb0e..95b8b74dc12f0df1768bececa43da888d1e48b47 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -62,8 +62,8 @@ importers:
+         specifier: 1.0.3
+         version: 1.0.3
+       youtubei.js:
+-        specifier: 17.0.1
+-        version: 17.0.1
++        specifier: 18.1.0
++        version: 18.1.0
+       zod:
+         specifier: ^4.2.1
+         version: 4.3.6
+@@ -1322,6 +1322,9 @@ packages:
+       picomatch:
+         optional: true
+ 
++  fflate@0.8.3:
++    resolution: {integrity: sha512-tbZNuJrLwGUp3zshBtdy4W+ORxZuIh8a5ilyIEQDC5rY1f3U20JMry0Ll3WBzU58EZKsEuJFXhb5gwv8CsPvgA==}
++
+   ffmpeg-static@5.3.0:
+     resolution: {integrity: sha512-H+K6sW6TiIX6VGend0KQwthe+kaceeH/luE8dIZyOP35ik7ahYojDuqlTV1bOrtEwl01sy2HFNGQfi5IDJvotg==}
+     engines: {node: '>=16'}
+@@ -1645,9 +1648,9 @@ packages:
+     resolution: {integrity: sha512-8q7VEgMJW4J8tcfVPy8g09NcQwZdbwFEqhe/WZkoIzjn/3TGDwtOCYtXGxA3O8tPzpczCCDgv+P2P5y00ZJOOg==}
+     engines: {node: '>= 8'}
+ 
+-  meriyah@6.1.4:
+-    resolution: {integrity: sha512-Sz8FzjzI0kN13GK/6MVEsVzMZEPvOhnmmI1lU5+/1cGOiK3QUahntrNNtdVeihrO7t9JpoH75iMNXg6R6uWflQ==}
+-    engines: {node: '>=18.0.0'}
++  meriyah@7.3.3:
++    resolution: {integrity: sha512-uE5cnoNj+UYhoMdZDuymCzr5TzEuE3ZF2C4kn6Z76rLhkwnvZ/+6dUZnM41T3fifyuhW0+n8vK7eq6DKJxUfPA==}
++    engines: {node: '>=20.0.0'}
+ 
+   methods@1.1.2:
+     resolution: {integrity: sha512-iclAHeNqNm68zFtnZ0e+1L2yUIdvzNoauKU4WBA3VvH/vPFieF7qfRlwUZU+DA9P9bPXIS90ulxoUoCH23sV2w==}
+@@ -2268,8 +2271,8 @@ packages:
+     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
+     engines: {node: '>=10'}
+ 
+-  youtubei.js@17.0.1:
+-    resolution: {integrity: sha512-1lO4b8UqMDzE0oh2qEGzbBOd4UYRdxn/4PdpRM7BGTHxM6ddsEsKZTu90jp8V9FHVgC2h1UirQyqoqLiKwl+Zg==}
++  youtubei.js@18.1.0:
++    resolution: {integrity: sha512-4Goo3ZeO6/kE8Mq67eC8Z9K1rijeqRwyKxf/YM4lqf8bB4r/s8JC0V3YFx7+l/AJR3LnAsulTsiIj+AFe0cduA==}
+ 
+   zimmerframe@1.1.2:
+     resolution: {integrity: sha512-rAbqEGa8ovJy4pyBxZM70hg4pE6gDgaQ0Sl9M3enG3I0d6H4XSAM3GeNGLKnsBpuijUow064sf7ww1nutC5/3w==}
+@@ -3286,6 +3289,8 @@ snapshots:
+     optionalDependencies:
+       picomatch: 4.0.4
+ 
++  fflate@0.8.3: {}
++
+   ffmpeg-static@5.3.0:
+     dependencies:
+       '@derhuerst/http-basic': 8.2.4
+@@ -3580,7 +3585,7 @@ snapshots:
+ 
+   merge2@1.4.1: {}
+ 
+-  meriyah@6.1.4: {}
++  meriyah@7.3.3: {}
+ 
+   methods@1.1.2: {}
+ 
+@@ -4147,10 +4152,11 @@ snapshots:
+ 
+   yocto-queue@0.1.0: {}
+ 
+-  youtubei.js@17.0.1:
++  youtubei.js@18.1.0:
+     dependencies:
+       '@bufbuild/protobuf': 2.2.5
+-      meriyah: 6.1.4
++      fflate: 0.8.3
++      meriyah: 7.3.3
+ 
+   zimmerframe@1.1.2: {}
+ 

@@ -1,0 +1,157 @@
+Subject: Support Facebook photo permalinks
+
+Adapted from https://github.com/imputnet/cobalt/pull/1610
+
+diff --git a/api/src/processing/service-config.js b/api/src/processing/service-config.js
+index fbe258053d0da2b10190c778544329688f13396a..600aaaf62c2b852f3ee5b8f1b0c171595797a61e 100644
+--- a/api/src/processing/service-config.js
++++ b/api/src/processing/service-config.js
+@@ -29,7 +29,9 @@ export const services = {
+             ":username/videos/:caption/:id",
+             ":username/videos/:id",
+             "reel/:id",
+-            "share/:shareType/:id"
++            "share/:shareType/:id",
++            "photo?fbid=:photoId",
++            "photo.php?fbid=:photoId"
+         ],
+         subdomains: ["web", "m"],
+         altDomains: ["fb.watch"],
+diff --git a/api/src/processing/service-patterns.js b/api/src/processing/service-patterns.js
+index 07bef989b7466da344186ebf1d5b3c7175aa9f67..5e062955f9de508fbe3df3ddb3cfb74cfd151915 100644
+--- a/api/src/processing/service-patterns.js
++++ b/api/src/processing/service-patterns.js
+@@ -15,7 +15,8 @@ export const testers = {
+         pattern.username?.length <= 30 ||
+         pattern.caption?.length <= 255 ||
+         pattern.id?.length <= 20 && !pattern.shareType ||
+-        pattern.id?.length <= 20 && pattern.shareType?.length === 1,
++        pattern.id?.length <= 20 && pattern.shareType?.length === 1 ||
++        pattern.photoId?.length <= 100,
+ 
+     "instagram": pattern =>
+         pattern.postId?.length <= 48 ||
+diff --git a/api/src/processing/services/facebook.js b/api/src/processing/services/facebook.js
+index 9e82dbe9f97c3737770c90bbff8d32de7ab14dc8..1c8ec7d37ac7cc361284b6aec9717b0a242349a1 100644
+--- a/api/src/processing/services/facebook.js
++++ b/api/src/processing/services/facebook.js
+@@ -8,6 +8,14 @@ const headers = {
+     'Sec-Fetch-Site': 'none',
+ }
+ 
++// m.facebook serves a lightweight photo page (with og:image) to mobile
++// user agents without requiring a login, unlike www/mbasic
++const photoHeaders = {
++    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.181 Mobile Safari/537.36',
++    'Accept': headers.Accept,
++    'Accept-Language': headers['Accept-Language'],
++}
++
+ const resolveUrl = (url, dispatcher) => {
+     return fetch(url, { headers, dispatcher })
+         .then(r => {
+@@ -23,7 +31,59 @@ const resolveUrl = (url, dispatcher) => {
+         .catch(() => false);
+ }
+ 
+-export default async function({ id, shareType, shortLink, dispatcher }) {
++const getPhoto = async (photoId, dispatcher) => {
++    let html = await fetch(`https://web.facebook.com/photo/?fbid=${photoId}`, {
++        headers, dispatcher
++    }).then(r => r.text())
++    .catch(() => false);
++
++    let image;
++    if (html) {
++        // the signed photo url is embedded in the page right
++        // after the graphql node of the photo itself
++        const node = html.indexOf(`"__isNode":"Photo","id":"${photoId}"`);
++        if (node !== -1) {
++            image = html.slice(node, node + 3000)
++                .match(/"(?:image|prefetch_uris_v2)":(?:\[\{|\{)"uri":"([^"]+)"/)?.[1];
++        }
++    }
++
++    if (!image) {
++        // fallback: m.facebook photo page (mobile user agent)
++        html = await fetch(`https://m.facebook.com/photo.php?fbid=${photoId}`, {
++            headers: photoHeaders, dispatcher
++        }).then(r => r.text())
++        .catch(() => false);
++        image = html?.match?.(/<meta property="og:image" content="([^"]+)"/)?.[1];
++    }
++
++    if (!image) return { error: "fetch.empty" };
++
++    // decode escaped url params and strip the /sNNNxNNN/ size
++    // transform some fbcdn urls carry, to get the original image
++    const url = image
++        .replace(/\\u002[fF]/g, '/')
++        .replace(/\\\//g, '/')
++        .replace(/\\u0026/g, '&')
++        .replace(/&amp;/g, '&')
++        .replace(/\/s\d+x\d+\//g, '/');
++
++    // fbcdn's stp=dst-jpg transform re-encodes any source to jpeg while
++    // keeping the original path extension, so it decides the extension
++    const ext = url.includes('stp=dst-jpg')
++        ? 'jpg'
++        : url.match(/\.(png|webp|jpe?g)(\?|$)/i)?.[1] || 'jpg';
++
++    return {
++        isPhoto: true,
++        urls: url,
++        filename: `facebook_${photoId}.${ext}`,
++    };
++}
++
++export default async function({ id, shareType, shortLink, photoId, dispatcher }) {
++    if (photoId) return getPhoto(photoId, dispatcher);
++
+     let url = `https://www.facebook.com/reel/${id}`;
+ 
+     if (shareType) url = `https://www.facebook.com/share/${shareType}/${id}`;
+diff --git a/api/src/processing/url.js b/api/src/processing/url.js
+index 26df685b972f393dbb35b6d9e95d448aea16d4ac..0f4faba29df5550c66f7e80e657d811a7bf81d57 100644
+--- a/api/src/processing/url.js
++++ b/api/src/processing/url.js
+@@ -141,6 +141,11 @@ function cleanURL(url) {
+                 limitQuery('v');
+             }
+             break;
++        case "facebook":
++            if (url.searchParams.get('fbid')) {
++                limitQuery('fbid');
++            }
++            break;
+         case "bilibili":
+         case "rutube":
+             if (url.searchParams.get('p')) {
+diff --git a/api/src/util/tests/facebook.json b/api/src/util/tests/facebook.json
+index 0f7f43a857e7a836a06e25016c54dfae4cee7de8..60f282ba284ac74c82455fba1e1ff18ae125be23 100644
+--- a/api/src/util/tests/facebook.json
++++ b/api/src/util/tests/facebook.json
+@@ -43,5 +43,23 @@
+             "code": 200,
+             "status": "redirect"
+         }
++    },
++    {
++        "name": "photo post",
++        "url": "https://www.facebook.com/photo/?fbid=1270547115300126&set=pb.100070345475708.-2207520000",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "tunnel"
++        }
++    },
++    {
++        "name": "photo post with story_fbid",
++        "url": "https://www.facebook.com/photo.php?fbid=1270547115300126&set=a.301410178880496.122345.100070345475708&story_fbid=pfbid02XvYqPnDmUgkRr1cTBhjLPzaWKzCUeNKFsQBz3d5S4LtYqPEMPqwxVhGRqL8ZbVEgl",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "tunnel"
++        }
+     }
+ ]

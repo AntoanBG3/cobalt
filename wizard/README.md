@@ -14,6 +14,16 @@ This branch (`wizard`) is not meant to be merged upstream.
 - `page.Dockerfile`, `nginx.conf.template`, `40-wizard-config.sh` — the page image.
   Set `API_URL` at runtime; it is written into `config.js` and the CSP on start.
 
+## Download changes carried by wizard
+
+| Upstream PR | What this fork carries |
+|---|---|
+| [#1611](https://github.com/imputnet/cobalt/pull/1611) | Fix rewritten HLS response headers and let downloads proceed if the optional size probe fails. |
+| [#1608](https://github.com/imputnet/cobalt/pull/1608) | Download AAC-only SoundCloud tracks and stream M4A files. |
+| [#1581](https://github.com/imputnet/cobalt/pull/1581) | Report empty media tunnels as errors and add the optional VISIONOS client. The default YouTube client is unchanged. Test on the deployment network before setting `CUSTOM_INNERTUBE_CLIENT=VISIONOS`. |
+| [#1610](https://github.com/imputnet/cobalt/pull/1610) | Support Facebook photo links and Tumblr carousels. The page asks for Tumblr items as download attachments. |
+| [#1590](https://github.com/imputnet/cobalt/pull/1590) | Download existing YouTube captions as TXT or SRT. Select **YouTube transcript** on the page. API clients can send `downloadMode: "captions"`, `captionFormat` (`txt` or `srt`), and an optional `captionLanguage`. |
+
 ## Images
 
 `.github/workflows/wizard.yml` builds on every push to `wizard/**`, weekly on Monday,
@@ -26,6 +36,17 @@ and on demand:
 
 Each build is also tagged with an immutable tag (`<version>-<upstream sha>-<fork sha>`
 for the API, the commit sha for the page) for rollbacks.
+
+To test a local API image after applying `patches/`, run the fixture and caption
+tests from the fork root. They don't contact media providers:
+
+```sh
+docker run --rm --platform linux/amd64 --network none \
+  -e API_URL=http://127.0.0.1:9900/ -e API_PORT=9900 \
+  -v "$PWD/wizard/tests/api.test.mjs:/app/fixture.test.mjs:ro" \
+  cobalt-wizard-review-api:local \
+  node --test --test-force-exit fixture.test.mjs src/processing/helpers/tests/captions.test.js
+```
 
 ## Compose sketch
 

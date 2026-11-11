@@ -1,0 +1,84 @@
+Subject: Support SoundCloud AAC and streamed M4A output
+
+Adapted from https://github.com/imputnet/cobalt/pull/1608
+
+diff --git a/api/src/processing/services/soundcloud.js b/api/src/processing/services/soundcloud.js
+index 9692a51948a56f31c969ae03fd54f39564b5ae7b..0a7055641461d11b0400306252406ce68e07e55d 100644
+--- a/api/src/processing/services/soundcloud.js
++++ b/api/src/processing/services/soundcloud.js
+@@ -43,6 +43,10 @@ async function findClientID() {
+     } catch {}
+ }
+ 
++// e.g. "aac_160k" -> 160, anything without a bitrate suffix -> 0
++const presetBitrate = (entry) =>
++    Number(entry?.preset?.match(/_(\d+)k$/)?.[1]) || 0;
++
+ const findBestForPreset = (transcodings, preset) => {
+     let inferior;
+     for (const entry of transcodings) {
+@@ -57,7 +61,10 @@ const findBestForPreset = (transcodings, preset) => {
+                 return entry;
+             }
+ 
+-            inferior = entry;
++            // prefer the highest bitrate when there are several (e.g. aac_160k & aac_96k)
++            if (!inferior || presetBitrate(entry) >= presetBitrate(inferior)) {
++                inferior = entry;
++            }
+         }
+     }
+ 
+@@ -123,6 +130,12 @@ export default async function(obj) {
+         bestAudio = "mp3"
+     }
+ 
++    // newer uploads often only have (unencrypted) aac hls transcodings
++    if (!selectedStream) {
++        selectedStream = findBestForPreset(json.media.transcodings, "aac");
++        bestAudio = "m4a";
++    }
++
+     if (!selectedStream) {
+         return { error: "fetch.empty" };
+     }
+diff --git a/api/src/stream/ffmpeg.js b/api/src/stream/ffmpeg.js
+index 4a72a309278160acceeb423d6d50905330127cf1..c3372eb8291eac7b0dcdbb331ca28fae8929f3a7 100644
+--- a/api/src/stream/ffmpeg.js
++++ b/api/src/stream/ffmpeg.js
+@@ -167,8 +167,11 @@ const convertAudio = async (streamInfo, res) => {
+         args.push('-vbr', 'off');
+     }
+ 
+-    if (streamInfo.audioFormat === 'mp4a') {
+-        args.push('-movflags', 'frag_keyframe+empty_moov');
++    // the ipod muxer can't write to a pipe without fragmenting. on long
++    // audio-only input, frag_keyframe output doesn't decode cleanly,
++    // so fragment by duration (1s) instead
++    if (streamInfo.audioFormat === 'm4a') {
++        args.push('-movflags', 'empty_moov', '-frag_duration', '1000000');
+     }
+ 
+     if (streamInfo.metadata) {
+diff --git a/api/src/util/tests/soundcloud.json b/api/src/util/tests/soundcloud.json
+index 67434cbde5e1d47cd4df78f49caafba06fe05575..a581a0e9921fd11e3eee6f3c2d0003bf040060c2 100644
+--- a/api/src/util/tests/soundcloud.json
++++ b/api/src/util/tests/soundcloud.json
+@@ -22,6 +22,17 @@
+             "status": "tunnel"
+         }
+     },
++    {
++        "name": "public song with only aac hls transcodings (mp3)",
++        "url": "https://soundcloud.com/forss/flickermood",
++        "params": {
++            "audioFormat": "mp3"
++        },
++        "expected": {
++            "code": 200,
++            "status": "tunnel"
++        }
++    },
+     {
+         "name": "private song",
+         "url": "https://soundcloud.com/user-798052861/asdasdasdsdsd/s-9TqZ7edLJ90",

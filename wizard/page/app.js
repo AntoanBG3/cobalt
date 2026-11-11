@@ -13,6 +13,8 @@ const statusField = $("status");
 const picker = $("picker");
 const pickerList = $("picker-list");
 const pickerAudio = $("picker-audio");
+const captionOptions = $("caption-options");
+const captionFormat = $("caption-format");
 
 let sitekey = null;
 let widgetId = null;
@@ -44,6 +46,8 @@ const MESSAGES = {
     "error.api.timed_out": "The server took too long to answer.",
     "error.api.unreachable": "Can't reach the server.",
     "error.api.youtube.login": "YouTube wants a login for this video.",
+    "error.api.service.captions_not_supported": "Transcript downloads are available for YouTube links.",
+    "error.api.captions.unavailable": "This video has no downloadable captions.",
 };
 
 const setStatus = (text) => { statusField.textContent = text; };
@@ -123,7 +127,7 @@ const getSession = async () => {
 
 // ---------- API ----------
 
-const requestMedia = async (url, mode, retried = false) => {
+const requestMedia = async (url, mode, format, retried = false) => {
     const headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -137,6 +141,7 @@ const requestMedia = async (url, mode, retried = false) => {
         body: JSON.stringify({
             url,
             downloadMode: mode,
+            ...(mode === "captions" && { captionFormat: format }),
             alwaysProxy: true,
             filenameStyle: "pretty",
             videoQuality: "1080",
@@ -147,7 +152,7 @@ const requestMedia = async (url, mode, retried = false) => {
 
     if (!retried && data.status === "error" && /^error\.api\.auth\.jwt/.test(data.error && data.error.code)) {
         session = null;
-        return requestMedia(url, mode, true);
+        return requestMedia(url, mode, format, true);
     }
     return data;
 };
@@ -211,16 +216,28 @@ const showPicker = (data) => {
 
 // ---------- UI ----------
 
+const selectedMode = () => form.querySelector("input[name=mode]:checked").value;
+
+const updateCaptionOptions = () => {
+    const show = selectedMode() === "captions";
+    captionOptions.hidden = !show;
+    captionFormat.disabled = !show;
+};
+
+form.addEventListener("change", updateCaptionOptions);
+window.addEventListener("pageshow", updateCaptionOptions);
+updateCaptionOptions();
+
 form.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (busy) return;
     const url = urlInput.value.trim();
     if (!url) return;
-    const mode = form.querySelector("input[name=mode]:checked").value;
+    const mode = selectedMode();
 
     setBusy(true);
     try {
-        const data = await requestMedia(url, mode);
+        const data = await requestMedia(url, mode, captionFormat.value);
         switch (data.status) {
             case "tunnel":
             case "redirect":

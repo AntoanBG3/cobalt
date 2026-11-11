@@ -45,6 +45,17 @@
                         <input id="mode-mute" type="radio" name="mode" value="mute">
                         <label for="mode-mute">Video without sound</label>
                     </div>
+                    <div class="field-row">
+                        <input id="mode-captions" type="radio" name="mode" value="captions">
+                        <label for="mode-captions">YouTube transcript</label>
+                    </div>
+                    <div class="field-row" id="caption-options" hidden>
+                        <label for="caption-format">Format</label>
+                        <select id="caption-format" disabled>
+                            <option value="txt">Plain text (.txt)</option>
+                            <option value="srt">Subtitles with timestamps (.srt)</option>
+                        </select>
+                    </div>
                 </fieldset>
 
                 <section class="buttons">
@@ -80,6 +91,7 @@
         <div class="window-body">
             <p>Paste a link to a post and press Download. The file goes straight to this device; nothing is kept on the server.</p>
             <p>Posts with several photos or videos open a list to pick from.</p>
+            <p>YouTube transcript saves existing captions as plain text or timed subtitles.</p>
             <p>Only save content you have the rights to.</p>
             <p>Powered by <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener">cobalt</a> (AGPL-3.0) &middot; <a href="https://github.com/AntoanBG3/cobalt/tree/wizard/wizard" target="_blank" rel="noopener">source</a>.</p>
         </div>

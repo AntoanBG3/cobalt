@@ -1,0 +1,181 @@
+Subject: Save all Tumblr media through the existing picker
+
+Adapted from https://github.com/imputnet/cobalt/pull/1610
+
+diff --git a/api/src/processing/match-action.js b/api/src/processing/match-action.js
+index ff7175c9e1ed3d574d281ddeffd2f312db08c173..3f6ac98f98fc2670a10b9217b1cec346560fffa5 100644
+--- a/api/src/processing/match-action.js
++++ b/api/src/processing/match-action.js
+@@ -103,6 +103,7 @@ export default function({
+                 case "twitter":
+                 case "snapchat":
+                 case "bsky":
++                case "tumblr":
+                     params = { picker: r.picker };
+                     break;
+ 
+diff --git a/api/src/processing/match.js b/api/src/processing/match.js
+index e97f7600c2a330368cff9899719c90d08d5f2e77..cd527e921cec50774a1f46377aa847cdcbfce246 100644
+--- a/api/src/processing/match.js
++++ b/api/src/processing/match.js
+@@ -160,7 +160,8 @@ export default async function({ host, patternMatch, params, authType }) {
+                 r = await tumblr({
+                     id: patternMatch.id,
+                     user: patternMatch.user,
+-                    url
++                    url,
++                    alwaysProxy: params.alwaysProxy,
+                 });
+                 break;
+ 
+diff --git a/api/src/processing/services/tumblr.js b/api/src/processing/services/tumblr.js
+index 2b8aa4ce28950c726e7830c787204c99c059e00d..38e41982a5ff94d52e2ff84955e00f222e53d7ab 100644
+--- a/api/src/processing/services/tumblr.js
++++ b/api/src/processing/services/tumblr.js
+@@ -1,5 +1,7 @@
+ import psl from "@imput/psl";
+ 
++import { createStream } from "../../stream/manage.js";
++
+ const API_KEY = 'jrsCWX1XDuVxAFO4GkK147syAoN8BJZ5voz8tS80bPcj26Vc5Z';
+ const API_BASE = 'https://api-http2.tumblr.com';
+ 
+@@ -18,6 +20,19 @@ function request(domain, id) {
+     }).then(a => a.json()).catch(() => {});
+ }
+ 
++const pickImage = (content) =>
++    content.media.reduce((a, b) => (a.width || 0) >= (b.width || 0) ? a : b);
++
++// tumblr serves actual gif data for `.gifv` media variants,
++// every other image variant is a jpg
++const imageExtension = (media) => {
++    const isGif = media.type === 'image/gif'
++               || media.url.endsWith('.gif')
++               || media.url.endsWith('.gifv');
++
++    return isGif ? 'gif' : 'jpg';
++}
++
+ export default async function(input) {
+     let { subdomain } = psl.parse(input.url.hostname);
+ 
+@@ -58,12 +73,66 @@ export default async function(input) {
+         }
+     }
+ 
+-    const video = contents.find(c => c.type === 'video');
+-    if (video && video.provider === 'tumblr') {
++    // collect every downloadable item from the post body and
++    // reblog trail: images and tumblr-hosted videos. embeds of
++    // other providers are not downloadable, so they're skipped
++    const media = [];
++    for (const content of contents) {
++        if (content.type === 'image' && content.media?.length) {
++            const image = pickImage(content);
++            media.push({
++                type: 'photo',
++                url: image.url,
++                ext: imageExtension(image),
++                thumbUrl: image.url
++            });
++        } else if (content.type === 'video' && content.provider === 'tumblr' && content.media?.url) {
++            media.push({
++                type: 'video',
++                url: content.media.url,
++                ext: 'mp4',
++                thumbUrl: content.poster?.[0]?.url || content.filmstrip?.url
++            });
++        }
++    }
++
++    if (media.length === 1) {
++        const item = media[0];
++
++        if (item.type === 'video') {
++            return {
++                urls: item.url,
++                filename: `tumblr_${input.id}.mp4`,
++                audioFilename: `tumblr_${input.id}_audio`
++            }
++        }
++
++        return {
++            urls: item.url,
++            isPhoto: true,
++            filename: `tumblr_${input.id}.${item.ext}`
++        }
++    }
++
++    if (media.length > 1) {
+         return {
+-            urls: video.media.url,
+-            filename: `tumblr_${input.id}.mp4`,
+-            audioFilename: `tumblr_${input.id}_audio`
++            picker: media.map((item, i) => ({
++                type: item.type,
++                url: input.alwaysProxy ? createStream({
++                    service: "tumblr",
++                    type: "proxy",
++                    url: item.url,
++                    filename: `tumblr_${input.id}_${i + 1}.${item.ext}`,
++                }) : item.url,
++                ...(item.thumbUrl && {
++                    thumb: createStream({
++                        service: "tumblr",
++                        type: "proxy",
++                        url: item.thumbUrl,
++                        filename: `tumblr_${input.id}_${i + 1}.jpg`
++                    })
++                })
++            }))
+         }
+     }
+ 
+diff --git a/api/src/util/tests/tumblr.json b/api/src/util/tests/tumblr.json
+index 3eb972668d43a8dbf610395a396ff3cb59c30589..84cf0875976d55178d49dfdc962914e224166f0a 100644
+--- a/api/src/util/tests/tumblr.json
++++ b/api/src/util/tests/tumblr.json
+@@ -23,7 +23,7 @@
+         "params": {},
+         "expected": {
+             "code": 200,
+-            "status": "redirect"
++            "status": "picker"
+         }
+     },
+     {
+@@ -45,5 +45,32 @@
+             "code": 200,
+             "status": "tunnel"
+         }
++    },
++    {
++        "name": "multi-image post",
++        "url": "https://www.tumblr.com/attonitos-gloria/831493577877094400/we-the-people-again-and-again-and-again-and-a",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "picker"
++        }
++    },
++    {
++        "name": "single image post with text",
++        "url": "https://www.tumblr.com/kosmogrl/831545911926767616/we-got-november-next-week",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "tunnel"
++        }
++    },
++    {
++        "name": "10-image post",
++        "url": "https://www.tumblr.com/humanoidhistory/831460578564423680/kaz-aizawa-box-art-for-nes-games-1988-1991",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "picker"
++        }
+     }
+ ]
+\ No newline at end of file

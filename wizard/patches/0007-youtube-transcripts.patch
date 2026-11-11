@@ -1,0 +1,971 @@
+Subject: Support standalone YouTube transcripts in TXT and SRT
+
+Adapted from https://github.com/imputnet/cobalt/pull/1590
+
+diff --git a/api/src/processing/helpers/caption-formats.js b/api/src/processing/helpers/caption-formats.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ea5db1c816568fa43d7e2e9a19cbc663f02bba3
+--- /dev/null
++++ b/api/src/processing/helpers/caption-formats.js
+@@ -0,0 +1,216 @@
++const namedEntities = {
++    amp: "&",
++    apos: "'",
++    gt: ">",
++    lt: "<",
++    nbsp: " ",
++    quot: '"',
++};
++
++const decodeEntities = text => text.replace(
++    /&(#(?:x[0-9a-f]+|\d+)|[a-z]+);/gi,
++    (entity, value) => {
++        if (value[0] !== "#") {
++            return namedEntities[value.toLowerCase()] ?? entity;
++        }
++
++        const hex = value[1]?.toLowerCase() === "x";
++        const codePoint = Number.parseInt(value.slice(hex ? 2 : 1), hex ? 16 : 10);
++        try {
++            return String.fromCodePoint(codePoint);
++        } catch {
++            return entity;
++        }
++    }
++);
++
++const cleanCueText = text => decodeEntities(
++    text
++        .replace(/<\d{2}:\d{2}(?::\d{2})?\.\d{3}>/g, "")
++        .replace(/<br\s*\/?>/gi, "\n")
++        .replace(/<[^>]+>/g, "")
++).split("\n")
++    .map(line => line.trim())
++    .filter(Boolean)
++    .join("\n");
++
++export const parseVtt = input => {
++    const normalized = input.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
++    const blocks = normalized.split(/\n{2,}/);
++    const cues = [];
++
++    for (const block of blocks) {
++        const lines = block.split("\n").map(line => line.trimEnd());
++        if (!lines.length || /^(WEBVTT|NOTE|STYLE|REGION)(?:\s|$)/.test(lines[0])) {
++            continue;
++        }
++
++        const timingIndex = lines.findIndex(line => line.includes(" --> "));
++        if (timingIndex < 0) continue;
++
++        const timing = lines[timingIndex].match(
++            /^(\d{2}:)?\d{2}:\d{2}\.\d{3}\s+-->\s+(\d{2}:)?\d{2}:\d{2}\.\d{3}/
++        )?.[0];
++        if (!timing) continue;
++
++        const [ start, end ] = timing.split(/\s+-->\s+/);
++        const text = cleanCueText(lines.slice(timingIndex + 1).join("\n"));
++        if (text) cues.push({ start, end, text });
++    }
++
++    return cues;
++};
++
++const timestampSeconds = timestamp => timestamp.split(":").reduce(
++    (seconds, part) => seconds * 60 + Number(part), 0
++);
++
++const vttTimestamp = seconds => {
++    const milliseconds = Math.round(seconds * 1000);
++    if (!Number.isFinite(milliseconds) || milliseconds < 0) {
++        throw new Error("invalid caption timestamp");
++    }
++    const hours = Math.floor(milliseconds / 3600000);
++    const minutes = Math.floor(milliseconds / 60000) % 60;
++    const remaining = milliseconds % 60000;
++    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:`
++        + `${(remaining / 1000).toFixed(3).padStart(6, "0")}`;
++};
++
++// HLS repeats boundary cues and may use a different local clock per segment.
++// Keep the first segment's timeline while applying subsequent timestamp maps.
++// https://www.rfc-editor.org/rfc/rfc8216#section-3.5
++export const mergeCaptionSegments = segments => {
++    const blocks = new Set();
++    const metadata = new Set();
++    const clockWrap = 2 ** 33;
++    let firstOffset, previousMpeg;
++    let adjustment;
++    let wraps = 0;
++
++    for (const segment of segments) {
++        const normalized = segment.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
++        const hasHeader = /^WEBVTT(?:\s|$)/.test(normalized);
++        if (hasHeader) {
++            const header = normalized.split(/\n{2,}/)[0];
++            const map = header.match(/^X-TIMESTAMP-MAP=(.+)$/m)?.[1];
++            const local = map?.match(/LOCAL:([\d:.]+)/)?.[1];
++            const mpeg = map?.match(/MPEGTS:(\d+)/)?.[1];
++            if (map && (!local || !mpeg)) throw new Error("invalid caption timestamp map");
++            const timestamp = Number(mpeg);
++            if (map && previousMpeg !== undefined
++                && timestamp - previousMpeg < -clockWrap / 2) wraps++;
++            if (map) previousMpeg = timestamp;
++            const offset = map
++                ? (timestamp + wraps * clockWrap) / 90000 - timestampSeconds(local)
++                : 0;
++            firstOffset ??= offset;
++            adjustment = offset - firstOffset;
++        } else if (adjustment === undefined) {
++            throw new Error("invalid VTT segment");
++        }
++
++        const segmentBlocks = normalized.split(/\n{2,}/).slice(hasHeader ? 1 : 0);
++        for (const block of segmentBlocks) {
++            if (/^(STYLE|REGION)(?:\s|$)/.test(block)) {
++                metadata.add(block.trimEnd());
++                continue;
++            }
++            if (/^NOTE(?:\s|$)/.test(block)) continue;
++            const lines = block.trimEnd().split("\n");
++            const timingIndex = lines.findIndex(line => line.includes(" --> "));
++            if (timingIndex < 0) continue;
++            const timing = lines[timingIndex].match(/^(\S+)\s+-->\s+(\S+)(.*)$/);
++            if (!timing) throw new Error("invalid caption cue");
++            const start = vttTimestamp(timestampSeconds(timing[1]) + adjustment);
++            const end = vttTimestamp(timestampSeconds(timing[2]) + adjustment);
++            // Identifiers can change across segments; timing and payload identify a cue.
++            blocks.add([
++                `${start} --> ${end}${timing[3]}`,
++                ...lines.slice(timingIndex + 1),
++            ].join("\n"));
++        }
++    }
++    return `WEBVTT\n\n${[...metadata, ...blocks].join("\n\n")}\n`;
++};
++
++const collapseRollingCues = cues => {
++    const result = [];
++    let run = [], rows = [], rolling = false;
++    const flush = () => {
++        if (rolling) {
++            result.push({ ...run[0], end: run.at(-1).end, text: rows.join("\n") });
++        } else {
++            for (const cue of run) result.push(cue);
++        }
++        run = [];
++        rows = [];
++        rolling = false;
++    };
++
++    for (const cue of cues) {
++        const nextRows = cue.text.split("\n");
++        const previous = run.at(-1);
++        let shared = 0;
++        if (previous && timestampSeconds(cue.start) >= timestampSeconds(previous.start)
++            && timestampSeconds(cue.start) <= timestampSeconds(previous.end)) {
++            const previousRows = previous.text.split("\n");
++            for (let count = Math.min(previousRows.length, nextRows.length); count > 0; count--) {
++                if (previousRows.slice(-count).every((row, index) => row === nextRows[index])) {
++                    shared = count;
++                    break;
++                }
++            }
++            // A changing multiline window distinguishes rolling text from repeated speech.
++            if (shared && previous.text !== cue.text
++                && (previousRows.length > 1 || nextRows.length > 1)) rolling = true;
++        }
++        if (!shared) flush();
++        for (const row of nextRows.slice(shared)) rows.push(row);
++        run.push(cue);
++    }
++    flush();
++    return result;
++};
++
++const transcriptLines = cues => {
++    const lines = [];
++    let previous;
++    for (const cue of collapseRollingCues(cues)) {
++        const text = cue.text.replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim();
++        if (!text) continue;
++
++        const overlaps = previous
++            && timestampSeconds(cue.start) >= timestampSeconds(previous.start)
++            && timestampSeconds(cue.start) < timestampSeconds(previous.end);
++        if (overlaps && (text === lines.at(-1) || text.startsWith(`${lines.at(-1)} `))) {
++            lines[lines.length - 1] = text;
++        } else {
++            lines.push(text);
++        }
++        previous = cue;
++    }
++    return lines;
++};
++
++const srtTimestamp = timestamp => {
++    const withHours = timestamp.split(":").length === 2 ? `00:${timestamp}` : timestamp;
++    return withHours.replace(".", ",");
++};
++
++export const convertCaptions = (input, format) => {
++    const cues = parseVtt(input);
++    if (!cues.length) throw new Error("caption file has no cues");
++
++    if (format === "srt") {
++        return cues.map((cue, index) => [
++            index + 1,
++            `${srtTimestamp(cue.start)} --> ${srtTimestamp(cue.end)}`,
++            cue.text,
++        ].join("\n")).join("\n\n") + "\n";
++    }
++
++    if (format === "txt") return transcriptLines(cues).join("\n\n") + "\n";
++
++    throw new Error("unsupported caption format");
++};
+diff --git a/api/src/processing/helpers/captions.js b/api/src/processing/helpers/captions.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4adc11c4e9e5f30a934270a44bb6fd91f55cac2
+--- /dev/null
++++ b/api/src/processing/helpers/captions.js
+@@ -0,0 +1,121 @@
++import { convertLanguageCode } from "../../misc/language-codes.js";
++
++// Services use both ISO 639-1 and ISO 639-2, sometimes with a script or region.
++export const normalizeCaptionLanguage = language => {
++    if (!language) return;
++    const [base, ...parts] = language.replaceAll("_", "-").split("-");
++    const normalized = [
++        base.length === 3 ? convertLanguageCode(base) || base : base,
++        ...parts,
++    ].join("-");
++    try {
++        return new Intl.Locale(normalized).toString();
++    } catch {
++        return normalized.toLowerCase();
++    }
++};
++
++const languageRank = (language, requested) => {
++    if (!requested) return 0;
++    if (!language) return Infinity;
++    if (language === requested) return 0;
++
++    try {
++        const track = new Intl.Locale(language);
++        const target = new Intl.Locale(requested);
++        if (track.language !== target.language) return Infinity;
++        // Bare languages accept any script. Explicit scripts or regions must
++        // not fall back to a different writing system, e.g. zh-Hant -> zh-Hans.
++        if ((target.script || target.region)
++            && track.maximize().script !== target.maximize().script) return Infinity;
++        return 1;
++    } catch {
++        return Infinity;
++    }
++};
++
++export const captionSelectionError = tracks => {
++    const available = tracks.filter(track => track.url);
++    if (!available.length) return { error: "captions.unavailable" };
++    return {
++        error: "captions.language_unavailable",
++        context: {
++            languages: [...new Set(available.map(track =>
++                normalizeCaptionLanguage(track.language)
++            ).filter(Boolean))],
++        },
++    };
++};
++
++export const createCaptionResponse = ({
++    url,
++    format,
++    language,
++    service,
++    id,
++    title,
++    author,
++}) => {
++    const resolvedTitle = title || `${service}_${id}`;
++    return {
++        type: "captions",
++        isCaptionOnly: true,
++        urls: url,
++            captionFormat: format,
++        captionLanguage: language || "unknown",
++        filenameAttributes: {
++            service,
++            id,
++            title: resolvedTitle,
++            author,
++        },
++    };
++};
++
++const captionResource = (resource, playlistURL) => {
++    const output = {
++        url: new URL(resource.uri, playlistURL).toString(),
++    };
++    if (resource.byterange) {
++        const { offset, length } = resource.byterange;
++        output.headers = { range: `bytes=${offset}-${offset + length - 1}` };
++    }
++    return output;
++};
++
++export const captionSegmentResources = (segments, playlistURL) => {
++    const resources = [];
++    let previousMap;
++
++    for (const segment of segments) {
++        if (segment.map) {
++            const map = captionResource(segment.map, playlistURL);
++            const mapKey = `${map.url}:${map.headers?.range || ""}`;
++            if (mapKey !== previousMap) {
++                resources.push(map);
++                previousMap = mapKey;
++            }
++        } else {
++            previousMap = undefined;
++        }
++        resources.push(captionResource(segment, playlistURL));
++    }
++    return resources;
++};
++
++// Tracks share { url, language, automatic, sourceFormat }; adapters may add fields.
++// Preserve source order when language rank and manual/automatic status are equal.
++export const selectCaptionTrack = (tracks, language, allowAutomatic = true) => {
++    const requested = normalizeCaptionLanguage(language);
++    let selected, bestRank = Infinity;
++    for (const track of tracks) {
++        if (!track.url || (!allowAutomatic && track.automatic)) continue;
++        const rank = languageRank(normalizeCaptionLanguage(track.language), requested) * 2
++            + Number(!!track.automatic);
++        if (rank < bestRank) {
++            selected = track;
++            bestRank = rank;
++        }
++    }
++    return selected;
++};
+diff --git a/api/src/processing/helpers/tests/captions.test.js b/api/src/processing/helpers/tests/captions.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..146df242e11e36dee8d7cc97bd8abe27a1aae34b
+--- /dev/null
++++ b/api/src/processing/helpers/tests/captions.test.js
+@@ -0,0 +1,134 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { captionSegmentResources, selectCaptionTrack } from "../captions.js";
++import { convertCaptions, mergeCaptionSegments, parseVtt } from "../caption-formats.js";
++import { apiSchema } from "../../schema.js";
++
++const sample = `\uFEFFWEBVTT\r
++\r
++NOTE generated fixture\r
++ignored\r
++\r
++first cue\r
++00:00.000 --> 00:02.500 align:start position:0%\r
++<c.colorE5E5E5>Hello &amp; welcome</c>\r
++\r
++00:02.500 --> 00:04.000\r
++Hello &amp; welcome back\r
++\r
++00:04.000 --> 00:06.250\r
++<v Speaker>Final line</v>\r
++`;
++
++test("parseVtt extracts and cleans cues", () => {
++    assert.deepEqual(parseVtt(sample), [
++        { start: "00:00.000", end: "00:02.500", text: "Hello & welcome" },
++        { start: "00:02.500", end: "00:04.000", text: "Hello & welcome back" },
++        { start: "00:04.000", end: "00:06.250", text: "Final line" },
++    ]);
++});
++
++test("plain text collapses growing automatic-caption cues", () => {
++    assert.equal(
++        convertCaptions(sample.replace("00:02.500 -->", "00:01.500 -->"), "txt"),
++        "Hello & welcome back\n\nFinal line\n"
++    );
++});
++
++test("SRT output numbers cues and converts timestamps", () => {
++    assert.match(convertCaptions(sample, "srt"), /^1\n00:00:00,000 --> 00:00:02,500/);
++    assert.match(convertCaptions(sample, "srt"), /3\n00:00:04,000 --> 00:00:06,250\nFinal line\n$/);
++});
++
++test("caption selection prefers manual tracks and matches base languages", () => {
++    const tracks = [
++        { url: "auto", language: "en-US", automatic: true },
++        { url: "manual", language: "en-GB" },
++        { url: "french", language: "fr" },
++    ];
++
++    assert.equal(selectCaptionTrack(tracks, "en", true), tracks[1]);
++    assert.equal(selectCaptionTrack(tracks, "en-AU", true), tracks[1]);
++    assert.equal(selectCaptionTrack(tracks, "en-US", false), tracks[1]);
++    assert.equal(selectCaptionTrack(tracks, undefined, true), tracks[1]);
++    assert.equal(selectCaptionTrack(tracks, "de", true), undefined);
++});
++
++test("empty and unknown caption formats fail", () => {
++    assert.throws(() => convertCaptions("WEBVTT\n", "txt"));
++    assert.throws(() => convertCaptions(sample, "json"));
++});
++
++test("caption API requests default to plain text and reject unknown formats", () => {
++    const parsed = apiSchema.safeParse({
++        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
++        downloadMode: "captions",
++    });
++
++    assert.equal(parsed.success, true);
++    assert.equal(parsed.data.captionFormat, "txt");
++    assert.equal(parsed.data.downloadMode, "captions");
++
++    assert.equal(apiSchema.safeParse({
++        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
++        downloadMode: "captions",
++        captionFormat: "json",
++    }).success, false);
++});
++
++test("adjoining rolling windows collapse but separate repeated speech survives", () => {
++    const input = "WEBVTT\n\n"
++        + "00:00.000 --> 00:00.010\nA new game\n\n"
++        + "00:00.010 --> 00:02.000\nA new game\n\n"
++        + "00:02.000 --> 00:04.000\nA new game\nwith a large world\n\n"
++        + "00:04.000 --> 00:06.000\nwith a large world\n\n"
++        + "00:10.000 --> 00:11.000\nNo.\n\n"
++        + "00:11.000 --> 00:12.000\nNo.\n";
++    assert.equal(convertCaptions(input, "txt"), "A new game with a large world\n\nNo.\n\nNo.\n");
++    assert.equal(convertCaptions(input, "srt").match(/ --> /g).length, 6);
++});
++
++test("HLS merging preserves cue settings and markup and removes repeated boundary cues", () => {
++    const cue = "00:00:09.000 --> 00:00:12.000 align:start\n<v Speaker>Hello &amp; welcome</v>";
++    const merged = mergeCaptionSegments([
++        `WEBVTT\n\nSTYLE\n::cue { color: white; }\n\nfirst-id\n${cue}\n`,
++        `WEBVTT\n\nnew-id\n${cue}\n\n00:00:12.000 --> 00:00:14.000\nSecond segment\n`,
++        "WEBVTT\n",
++    ]);
++    assert.equal(parseVtt(merged).length, 2);
++    assert.ok(merged.includes(cue));
++    assert.ok(merged.includes("STYLE\n::cue { color: white; }"));
++    assert.equal(convertCaptions(merged, "txt"), "Hello & welcome\n\nSecond segment\n");
++});
++
++test("HLS merging accepts media fragments after an initialization section", () => {
++    const merged = mergeCaptionSegments([
++        "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000\n",
++        "00:00:00.000 --> 00:00:02.000\nFirst fragment\n",
++        "00:00:02.000 --> 00:00:04.000\nSecond fragment\n",
++    ]);
++    assert.equal(convertCaptions(merged, "txt"), "First fragment\n\nSecond fragment\n");
++});
++
++test("HLS resources include changed initialization sections and byte ranges", () => {
++    const map = { uri: "captions.vtt", byterange: { offset: 0, length: 100 } };
++    const resources = captionSegmentResources([
++        { uri: "captions.vtt", byterange: { offset: 100, length: 50 }, map },
++        { uri: "captions.vtt", byterange: { offset: 150, length: 60 }, map },
++        {
++            uri: "captions.vtt",
++            byterange: { offset: 310, length: 70 },
++            map: { uri: "captions.vtt", byterange: { offset: 210, length: 100 } },
++        },
++    ], "https://example.com/path/playlist.m3u8");
++
++    assert.deepEqual(resources.map(resource => resource.headers.range), [
++        "bytes=0-99",
++        "bytes=100-149",
++        "bytes=150-209",
++        "bytes=210-309",
++        "bytes=310-379",
++    ]);
++    assert.ok(resources.every(resource => resource.url === "https://example.com/path/captions.vtt"));
++});
+diff --git a/api/src/processing/match-action.js b/api/src/processing/match-action.js
+index 3f6ac98f98fc2670a10b9217b1cec346560fffa5..40a40c237078eea9120150c5378ba69e262e6d1a 100644
+--- a/api/src/processing/match-action.js
++++ b/api/src/processing/match-action.js
+@@ -34,12 +34,14 @@ export default function({
+             requestIP,
+             originalRequest: r.originalRequest,
+             subtitles: r.subtitles,
++            captionFormat: r.captionFormat,
+             cover: !disableMetadata ? r.cover : false,
+             cropCover: !disableMetadata ? r.cropCover : false,
+         },
+         params = {};
+ 
+-    if (r.isPhoto) action = "photo";
++    if (r.isCaptionOnly) action = "captions";
++    else if (r.isPhoto) action = "photo";
+     else if (r.picker) action = "picker"
+     else if (r.isGif && convertGif) action = "gif";
+     else if (isAudioOnly) action = "audio";
+@@ -70,6 +72,26 @@ export default function({
+             params = { type: "proxy" };
+             break;
+ 
++        case "captions": {
++            const extension = r.captionFormat;
++            const language = r.captionLanguage;
++            const baseName = createFilename(
++                {
++                    ...r.filenameAttributes,
++                    extension,
++                    qualityLabel: language,
++                },
++                filenameStyle,
++                false,
++                false
++            );
++            params = {
++                type: "captions",
++                filename: baseName,
++            };
++            break;
++        }
++
+         case "gif":
+             params = { type: "gif" };
+             break;
+@@ -253,7 +275,7 @@ export default function({
+ 
+     // TODO: add support for HLS
+     // (very painful)
+-    if (!params.isHLS && responseType !== "picker") {
++    if (action !== "captions" && !params.isHLS && responseType !== "picker") {
+         const isPreferredWithExtra =
+             localProcessing === "preferred" && extraProcessingTypes.has(params.type);
+ 
+diff --git a/api/src/processing/match.js b/api/src/processing/match.js
+index cd527e921cec50774a1f46377aa847cdcbfce246..6eb3e64ce4a1864b83644644195e53ac4638e3c6 100644
+--- a/api/src/processing/match.js
++++ b/api/src/processing/match.js
+@@ -49,7 +49,8 @@ export default async function({ host, patternMatch, params, authType }) {
+     try {
+         let r,
+             isAudioOnly = params.downloadMode === "audio",
+-            isAudioMuted = params.downloadMode === "mute";
++            isAudioMuted = params.downloadMode === "mute",
++            isCaptionOnly = params.downloadMode === "captions";
+ 
+         if (!testers[host]) {
+             return createResponse("error", {
+@@ -65,6 +66,12 @@ export default async function({ host, patternMatch, params, authType }) {
+             });
+         }
+ 
++        if (isCaptionOnly && host !== "youtube") {
++            return createResponse("error", {
++                code: "error.api.service.captions_not_supported"
++            });
++        }
++
+         // youtubeHLS will be fully removed in the future
+         let youtubeHLS = params.youtubeHLS;
+         const hlsEnv = env.enableDeprecatedYoutubeHls;
+@@ -121,9 +128,12 @@ export default async function({ host, patternMatch, params, authType }) {
+                     dubLang: params.youtubeDubLang,
+                     youtubeHLS,
+                     subtitleLang,
++                    isCaptionOnly,
++                    captionLanguage: params.captionLanguage,
++                    captionFormat: params.captionFormat,
+                 }
+ 
+-                if (url.hostname === "music.youtube.com" || isAudioOnly) {
++                if (!isCaptionOnly && (url.hostname === "music.youtube.com" || isAudioOnly)) {
+                     fetchInfo.quality = "1080";
+                     fetchInfo.codec = "vp9";
+                     fetchInfo.isAudioOnly = true;
+@@ -285,7 +295,7 @@ export default async function({ host, patternMatch, params, authType }) {
+         }
+ 
+         if (r.error) {
+-            let context;
++            let context = r.context;
+             switch(r.error) {
+                 case "content.too_long":
+                     context = {
+diff --git a/api/src/processing/schema.js b/api/src/processing/schema.js
+index 7570a8b04d8e1b1b22bbafee9250d055aa03c15d..5997e5f771d146e67288b4dbe26ce91dbc2bf647 100644
+--- a/api/src/processing/schema.js
++++ b/api/src/processing/schema.js
+@@ -15,9 +15,13 @@ export const apiSchema = z.object({
+     ).default("mp3"),
+ 
+     downloadMode: z.enum(
+-        ["auto", "audio", "mute"]
++        ["auto", "audio", "mute", "captions"]
+     ).default("auto"),
+ 
++    captionFormat: z.enum(
++        ["txt", "srt"]
++    ).default("txt"),
++
+     filenameStyle: z.enum(
+         ["classic", "pretty", "basic", "nerdy"]
+     ).default("basic"),
+@@ -50,6 +54,12 @@ export const apiSchema = z.object({
+                      .regex(/^[0-9a-zA-Z\-]+$/)
+                      .optional(),
+ 
++    captionLanguage: z.string()
++                     .min(2)
++                     .max(8)
++                     .regex(/^[0-9a-zA-Z\-]+$/)
++                     .optional(),
++
+     disableMetadata: z.boolean().default(false),
+ 
+     allowH265: z.boolean().default(false),
+diff --git a/api/src/processing/services/youtube.js b/api/src/processing/services/youtube.js
+index 8d2f457a9b18a02f9532810029cdcb76b05398d7..d59fe80b7a99b163632516af9e53f816bbadc0a7 100644
+--- a/api/src/processing/services/youtube.js
++++ b/api/src/processing/services/youtube.js
+@@ -7,6 +7,12 @@ import { Innertube, Platform, Session } from "youtubei.js";
+ import { env } from "../../config.js";
+ import { getCookie } from "../cookie/manager.js";
+ import { getYouTubeSession } from "../helpers/youtube-session.js";
++import {
++    captionSegmentResources,
++    createCaptionResponse,
++    selectCaptionTrack,
++    captionSelectionError,
++} from "../helpers/captions.js";
+ 
+ // https://github.com/LuanRT/YouTube.js/pull/1052
+ Platform.shim.eval = async (data) => {
+@@ -112,13 +118,13 @@ const cloneInnertube = async (customFetch, useSession) => {
+     return yt;
+ }
+ 
+-const getHlsVariants = async (hlsManifest, dispatcher) => {
++const getHlsVariants = async (hlsManifest, dispatcher, signal) => {
+     if (!hlsManifest) {
+         return { error: "youtube.no_hls_streams" };
+     }
+ 
+     const fetchedHlsManifest =
+-        await fetch(hlsManifest, { dispatcher })
++        await fetch(hlsManifest, { dispatcher, signal })
+             .then(r => r.status === 200 ? r.text() : undefined)
+             .catch(() => {});
+ 
+@@ -137,12 +143,14 @@ const getHlsVariants = async (hlsManifest, dispatcher) => {
+     return variants;
+ }
+ 
+-const getSubtitles = async (info, dispatcher, subtitleLang) => {
+-    const preferredCap = info.captions.caption_tracks.find(caption =>
+-        caption.kind !== 'asr' && caption.language_code.startsWith(subtitleLang)
+-    );
++const captionTracks = info => (info.captions?.caption_tracks || []).map(track => ({
++    url: track.base_url,
++    language: track.language_code,
++    automatic: track.kind === "asr",
++}));
+ 
+-    const captionsUrl = preferredCap?.base_url;
++const getSubtitles = async (info, dispatcher, preferredCap, allSegments = false) => {
++    const captionsUrl = preferredCap?.url;
+     if (!captionsUrl) return;
+ 
+     if (!captionsUrl.includes("exp=xpe")) {
+@@ -151,7 +159,7 @@ const getSubtitles = async (info, dispatcher, subtitleLang) => {
+ 
+         return {
+             url: url.toString(),
+-            language: preferredCap.language_code,
++            language: preferredCap.language,
+         }
+     }
+ 
+@@ -159,9 +167,11 @@ const getSubtitles = async (info, dispatcher, subtitleLang) => {
+     // locked down and can't be accessed without a yummy potoken,
+     // so instead we just use subtitles from HLS
+ 
++    const signal = allSegments ? AbortSignal.timeout(10000) : undefined;
+     const hlsVariants = await getHlsVariants(
+-        info.streaming_data.hls_manifest_url,
+-        dispatcher
++        info.streaming_data?.hls_manifest_url,
++        dispatcher,
++        signal
+     );
+     if (hlsVariants?.error) return;
+ 
+@@ -169,22 +179,28 @@ const getSubtitles = async (info, dispatcher, subtitleLang) => {
+     const hlsSubtitles = hlsVariants[0]?.subtitles;
+     if (!hlsSubtitles?.length) return;
+ 
+-    const preferredHls = hlsSubtitles.find(
+-        subtitle => subtitle.language.startsWith(subtitleLang)
++    const preferredHls = selectCaptionTrack(
++        hlsSubtitles.map(subtitle => ({ ...subtitle, url: subtitle.uri })),
++        preferredCap.language
+     );
+ 
+     if (!preferredHls) return;
+ 
++    const playlistURL = new URL(preferredHls.uri, info.streaming_data.hls_manifest_url).toString();
+     const fetchedHlsSubs =
+-        await fetch(preferredHls.uri, { dispatcher })
++        await fetch(playlistURL, { dispatcher, signal })
+             .then(r => r.status === 200 ? r.text() : undefined)
+             .catch(() => {});
+ 
++    if (!fetchedHlsSubs) return;
+     const parsedSubs = HLS.parse(fetchedHlsSubs);
+-    if (!parsedSubs) return;
++    if (!parsedSubs?.segments?.length || (allSegments && parsedSubs.segments.length > 512)) return;
++    const urls = allSegments
++        ? captionSegmentResources(parsedSubs.segments, playlistURL)
++        : new URL(parsedSubs.segments[0].uri, playlistURL).toString();
+ 
+     return {
+-        url: parsedSubs.segments[0]?.uri,
++        url: urls,
+         language: preferredHls.language,
+     }
+ }
+@@ -219,7 +235,7 @@ export default async function (o) {
+         );
+ 
+     // we can get subtitles reliably only from the iOS client
+-    if (o.subtitleLang) {
++    if (o.subtitleLang || o.isCaptionOnly) {
+         innertubeClient = "IOS";
+         useSession = false;
+     }
+@@ -339,6 +355,25 @@ export default async function (o) {
+         }
+     }
+ 
++    if (o.isCaptionOnly) {
++        const tracks = captionTracks(info);
++        const selectedTrack = selectCaptionTrack(tracks, o.captionLanguage || o.subtitleLang);
++        if (!selectedTrack) return captionSelectionError(tracks);
++
++        const captions = await getSubtitles(info, o.dispatcher, selectedTrack, true);
++        if (!captions?.url) return { error: "captions.unavailable" };
++
++        return createCaptionResponse({
++            url: captions.url,
++            format: o.captionFormat,
++            language: captions.language,
++            service: "youtube",
++            id: o.id,
++            title: basicInfo.title?.trim(),
++            author: basicInfo.author?.replace("- Topic", "").trim(),
++        });
++    }
++
+     const normalizeQuality = res => {
+         const shortestSide = Math.min(res.height, res.width);
+         return videoQualities.find(qual => qual >= shortestSide);
+@@ -506,7 +541,13 @@ export default async function (o) {
+         }
+ 
+         if (o.subtitleLang && !o.isAudioOnly && info.captions?.caption_tracks?.length) {
+-            const videoSubtitles = await getSubtitles(info, o.dispatcher, o.subtitleLang);
++            const videoSubtitles = await getSubtitles(
++                info,
++                o.dispatcher,
++                captionTracks(info).find(track =>
++                    !track.automatic && track.language?.startsWith(o.subtitleLang)
++                )
++            );
+             if (videoSubtitles) {
+                 subtitles = videoSubtitles;
+             }
+diff --git a/api/src/stream/captions.js b/api/src/stream/captions.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f23c8997455b9eeed00047fbe2c44e99788b40f
+--- /dev/null
++++ b/api/src/stream/captions.js
+@@ -0,0 +1,77 @@
++import { Agent, request } from "undici";
++import { create as contentDisposition } from "content-disposition-header";
++
++import { closeRequest, closeResponse } from "./shared.js";
++import { destroyInternalStream } from "./manage.js";
++import { convertCaptions, mergeCaptionSegments } from "../processing/helpers/caption-formats.js";
++
++const defaultAgent = new Agent();
++const maxCaptionSize = 8 * 1024 * 1024;
++
++const contentTypes = {
++    srt: "application/x-subrip; charset=utf-8",
++    txt: "text/plain; charset=utf-8",
++};
++
++export default async function captions(streamInfo, res) {
++    const abortController = new AbortController();
++    const signal = AbortSignal.any([abortController.signal, AbortSignal.timeout(20000)]);
++    const urls = [streamInfo.urls].flat();
++    const cleanup = () => {
++        closeRequest(abortController);
++        urls.forEach(destroyInternalStream);
++    };
++    res.once("close", cleanup);
++    res.once("error", cleanup);
++
++    try {
++        if (res.destroyed) return;
++        const segments = [];
++        let size = 0;
++        for (const url of urls) {
++            const response = await request(url, {
++                signal,
++                maxRedirections: 4,
++                dispatcher: defaultAgent,
++            });
++
++            if (response.statusCode < 200 || response.statusCode > 299) {
++                return closeResponse(res);
++            }
++
++            const declaredSize = Number(response.headers["content-length"]);
++            if (size + declaredSize > maxCaptionSize) {
++                res.status(413).end();
++                return;
++            }
++
++            const chunks = [];
++            for await (const chunk of response.body) {
++                size += chunk.length;
++                if (size > maxCaptionSize) {
++                    res.status(413).end();
++                    return;
++                }
++                chunks.push(chunk);
++            }
++            segments.push(Buffer.concat(chunks).toString("utf8"));
++        }
++
++        const body = convertCaptions(
++            segments.length === 1 ? segments[0] : mergeCaptionSegments(segments),
++            streamInfo.captionFormat
++        );
++
++        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
++        res.setHeader("Content-Disposition", contentDisposition(streamInfo.filename));
++        res.setHeader("Content-Type", contentTypes[streamInfo.captionFormat]);
++        res.setHeader("Content-Length", Buffer.byteLength(body));
++        res.status(200).send(body);
++    } catch {
++        if (!res.destroyed) closeResponse(res);
++    } finally {
++        cleanup();
++        res.off("close", cleanup);
++        res.off("error", cleanup);
++    }
++}
+diff --git a/api/src/stream/manage.js b/api/src/stream/manage.js
+index 93e9e652473ea61dfb2892fb4ed8b85e26b347ef..5c8213a09760dd4207e7e42c14c8c1c4f39ca03c 100644
+--- a/api/src/stream/manage.js
++++ b/api/src/stream/manage.js
+@@ -45,6 +45,8 @@ export function createStream(obj) {
+ 
+             // url to a subtitle file
+             subtitles: obj.subtitles,
++
++            captionFormat: obj.captionFormat,
+         };
+ 
+     // FIXME: this is now a Promise, but it is not awaited
+@@ -259,17 +261,32 @@ const transplantTunnel = async function (dispatcher) {
+ function wrapStream(streamInfo) {
+     const url = streamInfo.urls;
+ 
++    const createWrappedStream = resource => {
++        if (typeof resource === "string") {
++            return createInternalStream(resource, streamInfo, streamInfo.type === "captions");
++        }
++        if (streamInfo.type !== "captions" || typeof resource?.url !== "string") {
++            throw "invalid url";
++        }
++        return createInternalStream(
++            resource.url,
++            {
++                ...streamInfo,
++                headers: { ...streamInfo.headers, ...resource.headers },
++            },
++            true
++        );
++    };
++
+     if (streamInfo.originalRequest) {
+         streamInfo.transplant = transplantTunnel.bind(streamInfo);
+     }
+ 
+     if (typeof url === 'string') {
+-        streamInfo.urls = createInternalStream(url, streamInfo);
++        streamInfo.urls = createWrappedStream(url);
+     } else if (Array.isArray(url)) {
+         for (const idx in streamInfo.urls) {
+-            streamInfo.urls[idx] = createInternalStream(
+-                streamInfo.urls[idx], streamInfo
+-            );
++            streamInfo.urls[idx] = createWrappedStream(streamInfo.urls[idx]);
+         }
+     } else throw 'invalid urls';
+ 
+diff --git a/api/src/stream/stream.js b/api/src/stream/stream.js
+index 1290c029ed98d29f93655d45a1c29dca5f5b201a..5e6205717680a36f974630b44011e5056af28a09 100644
+--- a/api/src/stream/stream.js
++++ b/api/src/stream/stream.js
+@@ -1,5 +1,6 @@
+ import proxy from "./proxy.js";
+ import ffmpeg from "./ffmpeg.js";
++import captions from "./captions.js";
+ 
+ import { closeResponse } from "./shared.js";
+ import { internalStream } from "./internal.js";
+@@ -10,6 +11,9 @@ export default async function(res, streamInfo) {
+             case "proxy":
+                 return await proxy(streamInfo, res);
+ 
++            case "captions":
++                return await captions(streamInfo, res);
++
+             case "internal":
+                 return await internalStream(streamInfo.data, res);
+ 
+diff --git a/api/src/util/tests/youtube.json b/api/src/util/tests/youtube.json
+index cb4964bebfa4dc8649d6b77aae99bc42a5c67e9b..4a83fb184a32860bdbffe2cedeaa38f50743005d 100644
+--- a/api/src/util/tests/youtube.json
++++ b/api/src/util/tests/youtube.json
+@@ -240,5 +240,19 @@
+             "code": 200,
+             "status": "tunnel"
+         }
++    },
++    {
++        "name": "standalone English transcript",
++        "url": "https://www.youtube.com/watch?v=vPwaXytZcgI",
++        "canFail": true,
++        "params": {
++            "downloadMode": "captions",
++            "captionFormat": "txt",
++            "subtitleLang": "en"
++        },
++        "expected": {
++            "code": 200,
++            "status": "tunnel"
++        }
+     }
+-]
+\ No newline at end of file
++]
