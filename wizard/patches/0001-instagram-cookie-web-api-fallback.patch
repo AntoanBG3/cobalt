@@ -1,0 +1,54 @@
+From 8b6e12c0f2402c3df50efbfb9dd37ebbac50e267 Mon Sep 17 00:00:00 2001
+From: AntoanBG3 <161139999+AntoanBG3@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 10:34:06 +0200
+Subject: [PATCH] api/instagram: fall back to web api when mobile api rejects
+ cookie session
+
+with instagram cookies configured, the cookie request to the mobile api
+(i.instagram.com/api/v1/media/<id>/info/) now fails with
+challenge_required (unsupported_version), most likely because of the old
+android app user agent. anonymous requests to the same endpoint fail
+with login_required, and the embed fallback no longer has video data, so
+getPost ends up on a response with only display_url and returns the
+cover image as a photo for reels and videos.
+
+the web api (www.instagram.com/api/v1/media/<id>/info/) accepts the same
+cookie and returns the same item with video_versions, so try it when the
+mobile api returns nothing and a cookie is set.
+---
+ api/src/processing/services/instagram.js | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/api/src/processing/services/instagram.js b/api/src/processing/services/instagram.js
+index 0fa2552..173b3ae 100644
+--- a/api/src/processing/services/instagram.js
++++ b/api/src/processing/services/instagram.js
+@@ -135,6 +135,15 @@ export default function instagram(obj) {
+         return mediaInfo?.items?.[0];
+     }
+ 
++    async function requestWebApi(mediaId, cookie) {
++        const mediaInfo = await request(
++            `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
++            cookie
++        ).catch(() => {});
++
++        return mediaInfo?.items?.[0];
++    }
++
+     async function requestHTML(id, cookie) {
+         const data = await fetch(`https://www.instagram.com/p/${id}/embed/captioned/`, {
+             headers: {
+@@ -436,6 +445,9 @@ export default function instagram(obj) {
+             if (media_id && !hasData(data)) data = await requestMobileApi(media_id);
+             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
+ 
++            // web api (cookie), in case the mobile api rejects the cookie session
++            if (media_id && cookie && !hasData(data)) data = await requestWebApi(media_id, cookie);
++
+             // html embed (no cookie, cookie)
+             if (!hasData(data)) data = await requestHTML(id);
+             if (!hasData(data) && cookie) data = await requestHTML(id, cookie);
+-- 
+2.43.0
+

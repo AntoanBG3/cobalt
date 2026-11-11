@@ -1,0 +1,124 @@
+:root {
+    --desktop: #008080;
+}
+
+html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--desktop);
+}
+
+body {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 48px 16px;
+    box-sizing: border-box;
+    min-height: 100vh;
+}
+
+#main-window {
+    width: 100%;
+    max-width: 520px;
+}
+
+.title-bar-text {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.window-body {
+    margin: 12px;
+}
+
+#url {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 16px; /* stops iOS zooming into the field */
+    height: 28px;
+}
+
+fieldset {
+    margin-top: 12px;
+}
+
+.buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 12px;
+}
+
+.buttons button {
+    min-width: 88px;
+    min-height: 28px;
+}
+
+button.default {
+    outline: 1px solid #000;
+    outline-offset: -1px;
+}
+
+#picker-list {
+    max-height: 50vh;
+    overflow-y: auto;
+    padding: 6px;
+    margin: 0;
+}
+
+#picker-list li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    list-style: none;
+}
+
+#picker-list li::before {
+    display: none;
+}
+
+#picker-list img,
+#picker-list .thumb-blank {
+    width: 56px;
+    height: 56px;
+    object-fit: cover;
+    border: 1px solid #808080;
+}
+
+#picker-list span {
+    flex: 1;
+}
+
+#turnstile-widget {
+    position: fixed;
+    bottom: 0;
+    right: 0;
+}
+
+#help-window {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(360px, calc(100vw - 32px));
+    z-index: 10;
+}
+
+.status-bar-field:first-child {
+    flex: 3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+@media (max-width: 480px) {
+    body {
+        padding: 16px;
+    }
+}

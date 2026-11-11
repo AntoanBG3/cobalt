@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Downloader</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="98.css">
+    <link rel="stylesheet" href="style.css">
+    <script src="config.js"></script>
+    <script src="app.js" defer></script>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
+</head>
+<body>
+    <main class="window" id="main-window">
+        <div class="title-bar">
+            <div class="title-bar-text">
+                <img src="icon.svg" alt="" width="16" height="16">
+                Downloader
+            </div>
+            <div class="title-bar-controls">
+                <button aria-label="Help" id="help-button" type="button"></button>
+            </div>
+        </div>
+        <div class="window-body">
+            <form id="form" autocomplete="off">
+                <div class="field-row-stacked">
+                    <label for="url">Paste a link from X, Instagram, TikTok, Facebook and more:</label>
+                    <input id="url" type="url" inputmode="url" required
+                           placeholder="https://www.instagram.com/reel/..." spellcheck="false">
+                </div>
+
+                <fieldset>
+                    <legend>Save as</legend>
+                    <div class="field-row">
+                        <input id="mode-auto" type="radio" name="mode" value="auto" checked>
+                        <label for="mode-auto">Video</label>
+                    </div>
+                    <div class="field-row">
+                        <input id="mode-audio" type="radio" name="mode" value="audio">
+                        <label for="mode-audio">Audio only</label>
+                    </div>
+                    <div class="field-row">
+                        <input id="mode-mute" type="radio" name="mode" value="mute">
+                        <label for="mode-mute">Video without sound</label>
+                    </div>
+                </fieldset>
+
+                <section class="buttons">
+                    <button type="button" id="paste-button">Paste</button>
+                    <button type="submit" id="go-button" class="default">Download</button>
+                </section>
+            </form>
+
+            <section id="picker" hidden>
+                <p id="picker-title">This post has several items. Pick what to save:</p>
+                <ul class="tree-view" id="picker-list"></ul>
+                <section class="buttons">
+                    <button type="button" id="picker-audio" hidden>Save audio</button>
+                    <button type="button" id="picker-close">Close</button>
+                </section>
+            </section>
+
+            <div id="turnstile-widget"></div>
+        </div>
+        <div class="status-bar">
+            <p class="status-bar-field" id="status">Starting...</p>
+            <p class="status-bar-field" id="server">wizard</p>
+        </div>
+    </main>
+
+    <div class="window" id="help-window" hidden>
+        <div class="title-bar">
+            <div class="title-bar-text">Help</div>
+            <div class="title-bar-controls">
+                <button aria-label="Close" id="help-close" type="button"></button>
+            </div>
+        </div>
+        <div class="window-body">
+            <p>Paste a link to a post and press Download. The file goes straight to this device; nothing is kept on the server.</p>
+            <p>Posts with several photos or videos open a list to pick from.</p>
+            <p>Only save content you have the rights to.</p>
+            <p>Powered by <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener">cobalt</a> (AGPL-3.0) &middot; <a href="https://github.com/AntoanBG3/cobalt/tree/wizard/wizard" target="_blank" rel="noopener">source</a>.</p>
+        </div>
+    </div>
+</body>
+</html>

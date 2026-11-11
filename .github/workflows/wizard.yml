@@ -1,0 +1,133 @@
+name: wizard images
+
+# Builds the images the "wizard" home server runs:
+#   ghcr.io/<owner>/cobalt-api:wizard   upstream imputnet/cobalt main + wizard/patches
+#   ghcr.io/<owner>/cobalt-page:wizard  the Win98-style page in wizard/page
+# Runs weekly so upstream fixes arrive without a manual merge.
+
+on:
+  push:
+    branches: [wizard]
+    paths:
+      - "wizard/**"
+      - ".github/workflows/wizard.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: wizard-images
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  UPSTREAM: imputnet/cobalt
+  UPSTREAM_REF: main
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out wizard files
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Check out upstream cobalt
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Apply wizard patches
+        working-directory: upstream
+        run: |
+          shopt -s nullglob
+          for p in ../fork/wizard/patches/*.patch; do
+            if git apply --check "$p" 2>/dev/null; then
+              git apply "$p"
+              echo "applied: $(basename "$p")"
+            elif git apply --reverse --check "$p" 2>/dev/null; then
+              echo "already upstream, skipped: $(basename "$p")"
+            else
+              echo "::error::patch no longer applies: $(basename "$p")"
+              exit 1
+            fi
+          done
+
+      - name: Image metadata
+        id: meta
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          version=$(jq -r .version upstream/api/package.json)
+          upstream_sha=$(git -C upstream rev-parse --short HEAD)
+          echo "image=${REGISTRY}/${owner}/cobalt-api" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${version}-${upstream_sha}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:wizard
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=cobalt api (upstream ${{ env.UPSTREAM_REF }} + wizard patches)
+            org.opencontainers.image.licenses=AGPL-3.0
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+  page:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image metadata
+        id: meta
+        run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${REGISTRY}/${owner}/cobalt-page" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: wizard/page.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:wizard
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Win98-style downloader page for a cobalt api
+          cache-from: type=gha,scope=page
+          cache-to: type=gha,scope=page,mode=max
