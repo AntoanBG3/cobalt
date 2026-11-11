@@ -277,8 +277,50 @@ $("paste-button").addEventListener("click", async () => {
 });
 
 $("picker-close").addEventListener("click", () => { closePicker(); setStatus("Ready"); });
-$("help-button").addEventListener("click", () => { $("help-window").hidden = false; });
-$("help-close").addEventListener("click", () => { $("help-window").hidden = true; });
+
+// ---------- Help window ----------
+
+const helpWindow = $("help-window");
+const helpTitleBar = helpWindow.querySelector(".title-bar");
+let helpDrag = null;
+
+const positionHelp = (left, top) => {
+    helpWindow.style.transform = "none";
+    helpWindow.style.left = `${Math.max(0, Math.min(left, window.innerWidth - helpWindow.offsetWidth))}px`;
+    helpWindow.style.top = `${Math.max(0, Math.min(top, window.innerHeight - helpWindow.offsetHeight))}px`;
+};
+
+const keepHelpInView = () => {
+    if (helpWindow.hidden || !helpWindow.style.left) return;
+    const bounds = helpWindow.getBoundingClientRect();
+    positionHelp(bounds.left, bounds.top);
+};
+
+helpTitleBar.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0 || event.target.closest("button")) return;
+    event.preventDefault();
+    const bounds = helpWindow.getBoundingClientRect();
+    helpDrag = { pointerId: event.pointerId, x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    positionHelp(bounds.left, bounds.top);
+    document.body.setPointerCapture(event.pointerId);
+});
+
+document.body.addEventListener("pointermove", (event) => {
+    if (helpDrag?.pointerId !== event.pointerId) return;
+    positionHelp(event.clientX - helpDrag.x, event.clientY - helpDrag.y);
+});
+
+for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) {
+    document.body.addEventListener(name, (event) => {
+        if (helpDrag?.pointerId !== event.pointerId) return;
+        helpDrag = null;
+        if (document.body.hasPointerCapture(event.pointerId)) document.body.releasePointerCapture(event.pointerId);
+    });
+}
+
+window.addEventListener("resize", keepHelpInView);
+$("help-button").addEventListener("click", () => { helpWindow.hidden = false; keepHelpInView(); });
+$("help-close").addEventListener("click", () => { helpWindow.hidden = true; });
 
 // Allow https://dl.example/#<link> to prefill, like cobalt's own page.
 if (location.hash.length > 1) {

@@ -106,6 +106,17 @@ button.default {
     z-index: 10;
 }
 
+#help-window > .title-bar {
+    cursor: move;
+    user-select: none;
+}
+
+#help-window .title-bar-text {
+    flex: 1;
+    align-self: stretch;
+    touch-action: none;
+}
+
 .status-bar-field:first-child {
     flex: 3;
     overflow: hidden;
