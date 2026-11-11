@@ -1,0 +1,156 @@
+Subject: Download Bluesky videos that have no audio track
+
+Adapted from https://github.com/imputnet/cobalt/pull/1546. Only the optional
+audio map and the regression test are carried; 0002 already sets the HLS
+playlist headers this PR also changed.
+
+diff --git a/api/src/core/itunnel.js b/api/src/core/itunnel.js
+index e16c034..5061e4a 100644
+--- a/api/src/core/itunnel.js
++++ b/api/src/core/itunnel.js
+@@ -49,13 +49,16 @@ export const setupTunnelHandler = () => {
+     tunnelHandler.use((_, __, res, ____) => res.socket.end());
+ 
+ 
+-    const server = tunnelHandler.listen({
+-        port: 0,
+-        host: '127.0.0.1',
+-        exclusive: true
+-    }, () => {
+-        const { port } = server.address();
+-        console.log(`${Green('[✓]')} internal tunnel handler running on 127.0.0.1:${port}`);
+-        setTunnelPort(port);
++    return new Promise((resolve) => {
++        const server = tunnelHandler.listen({
++            port: 0,
++            host: '127.0.0.1',
++            exclusive: true
++        }, () => {
++            const { port } = server.address();
++            console.log(`${Green('[✓]')} internal tunnel handler running on 127.0.0.1:${port}`);
++            setTunnelPort(port);
++            resolve(server);
++        });
+     });
+ }
+diff --git a/api/src/misc/run-test.js b/api/src/misc/run-test.js
+index 6dd0818..b6bba06 100644
+--- a/api/src/misc/run-test.js
++++ b/api/src/misc/run-test.js
+@@ -1,6 +1,47 @@
++import { Writable } from "node:stream";
++
+ import { normalizeRequest } from "../processing/request.js";
+ import match from "../processing/match.js";
+ import { extract } from "../processing/url.js";
++import stream from "../stream/stream.js";
++import { verifyStream } from "../stream/manage.js";
++
++class MockResponse extends Writable {
++    constructor() {
++        super();
++        this.statusCode = 200;
++        this.bytes = 0;
++        this.headersSent = false;
++    }
++    setHeader() {}
++    status(code) { this.statusCode = code; return this; }
++    sendStatus(code) { this.statusCode = code; this.end(); return this; }
++    _write(chunk, _, cb) { this.bytes += chunk.length; this.headersSent = true; cb(); }
++}
++
++async function drainTunnel(tunnelUrl) {
++    const u = new URL(tunnelUrl);
++    const streamInfo = await verifyStream(
++        u.searchParams.get('id'),
++        u.searchParams.get('sig'),
++        u.searchParams.get('exp'),
++        u.searchParams.get('sec'),
++        u.searchParams.get('iv'),
++    );
++    if (!streamInfo?.service) {
++        throw `verifyStream failed: status ${streamInfo?.status}`;
++    }
++
++    const res = new MockResponse();
++    await new Promise((resolve, reject) => {
++        res.on('finish', resolve);
++        res.on('close', resolve);
++        res.on('error', reject);
++        stream(res, streamInfo).catch(reject);
++    });
++
++    return res;
++}
+ 
+ export async function runTest(url, params, expect) {
+     const { success, data: normalized } = await normalizeRequest({ url, ...params });
+@@ -47,7 +88,10 @@ export async function runTest(url, params, expect) {
+         throw error.join('\n');
+     }
+ 
+-    if (result.body.status === 'tunnel') {
+-        // TODO: stream testing
++    if (result.body.status === 'tunnel' && expect.minBytes) {
++        const res = await drainTunnel(result.body.url);
++        if (res.bytes < expect.minBytes) {
++            throw `streamed ${res.bytes} bytes, expected at least ${expect.minBytes}`;
++        }
+     }
+ }
+diff --git a/api/src/stream/ffmpeg.js b/api/src/stream/ffmpeg.js
+index 3c41d40..2fcdcc9 100644
+--- a/api/src/stream/ffmpeg.js
++++ b/api/src/stream/ffmpeg.js
+@@ -132,7 +132,7 @@ const remux = async (streamInfo, res) => {
+     } else {
+         args.push(
+             '-map', '0:v:0',
+-            '-map', '0:a:0'
++            '-map', '0:a:0?'
+         );
+     }
+ 
+diff --git a/api/src/util/test.js b/api/src/util/test.js
+index 98a9f13..3713d3d 100644
+--- a/api/src/util/test.js
++++ b/api/src/util/test.js
+@@ -8,6 +8,7 @@ import { setGlobalDispatcher, EnvHttpProxyAgent, ProxyAgent } from "undici";
+ import { randomizeCiphers } from "../misc/randomize-ciphers.js";
+ 
+ import { services } from "../processing/service-config.js";
++import { setupTunnelHandler } from "../core/itunnel.js";
+ 
+ const getTestPath = service => path.join('./src/util/tests/', `./${service}.json`);
+ const getTests = (service) => loadJSON(getTestPath(service));
+@@ -78,6 +79,9 @@ env.streamLifespan = 10000;
+ env.apiURL = 'http://x/';
+ randomizeCiphers();
+ 
++const tunnelServer = await setupTunnelHandler();
++tunnelServer.unref();
++
+ const action = process.argv[2];
+ switch (action) {
+     case "get-services":
+diff --git a/api/src/util/tests/bsky.json b/api/src/util/tests/bsky.json
+index 6e1d6b2..f501ddd 100644
+--- a/api/src/util/tests/bsky.json
++++ b/api/src/util/tests/bsky.json
+@@ -75,6 +75,16 @@
+             "status": "tunnel"
+         }
+     },
++    {
++        "name": "video-only HLS (gif-presentation)",
++        "url": "https://bsky.app/profile/yungkhan.bsky.social/post/3mkt7ph5z3s2z",
++        "params": {},
++        "expected": {
++            "code": 200,
++            "status": "tunnel",
++            "minBytes": 1024
++        }
++    },
+     {
+         "name": "several images",
+         "url": "https://bsky.app/profile/did:plc:rai7s6su2sy22ss7skouedl7/post/3kzxuxbiul626",

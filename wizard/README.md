@@ -23,6 +23,9 @@ This branch (`wizard`) is not meant to be merged upstream.
 | [#1581](https://github.com/imputnet/cobalt/pull/1581) | Report empty media tunnels as errors and add the optional VISIONOS client. The default YouTube client is unchanged. Test on the deployment network before setting `CUSTOM_INNERTUBE_CLIENT=VISIONOS`. |
 | [#1610](https://github.com/imputnet/cobalt/pull/1610) | Support Facebook photo links and Tumblr carousels. The page asks for Tumblr items as download attachments. |
 | [#1590](https://github.com/imputnet/cobalt/pull/1590) | Download existing YouTube captions as TXT or SRT. Select **YouTube transcript** on the page. API clients can send `downloadMode: "captions"`, `captionFormat` (`txt` or `srt`), and an optional `captionLanguage`. |
+| [#1533](https://github.com/imputnet/cobalt/pull/1533) | Ignore a missing (`null`) Facebook HD or SD link instead of matching another video's link further down the page. |
+| [#1546](https://github.com/imputnet/cobalt/pull/1546) | Download Bluesky videos that have no audio track (the ffmpeg audio map is optional). The playlist header part is already in 0002. |
+| [#1558](https://github.com/imputnet/cobalt/pull/1558) | Support Threads posts (`threads.com` and `threads.net`): videos, photos, GIFs and carousels. |
 
 ## Images
 
