@@ -81,9 +81,9 @@
         </div>
     </main>
 
-    <div class="window" id="help-window" hidden>
+    <div class="window" id="help-window" role="dialog" aria-labelledby="help-title" hidden>
         <div class="title-bar">
-            <div class="title-bar-text">Help</div>
+            <div class="title-bar-text" id="help-title">Help</div>
             <div class="title-bar-controls">
                 <button aria-label="Close" id="help-close" type="button"></button>
             </div>
@@ -94,6 +94,9 @@
             <p>YouTube transcript saves existing captions as plain text or timed subtitles.</p>
             <p>Only save content you have the rights to.</p>
             <p>Powered by <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener">cobalt</a> (AGPL-3.0) &middot; <a href="https://github.com/AntoanBG3/cobalt/tree/wizard/wizard" target="_blank" rel="noopener">source</a>.</p>
+            <section class="buttons">
+                <button type="button" id="help-ok">OK</button>
+            </section>
         </div>
     </div>
 </body>

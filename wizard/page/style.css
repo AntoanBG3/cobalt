@@ -97,24 +97,23 @@ button.default {
     right: 0;
 }
 
+/* Help opens over the page window, like a Win98 dialog over its parent */
 #help-window {
     position: fixed;
-    top: 50%;
+    top: 96px;
     left: 50%;
-    transform: translate(-50%, -50%);
-    width: min(360px, calc(100vw - 32px));
+    transform: translateX(-50%);
+    box-sizing: border-box;
+    width: min(380px, calc(100vw - 32px));
     z-index: 10;
 }
 
-#help-window > .title-bar {
-    cursor: move;
-    user-select: none;
+.help-open #main-window > .title-bar {
+    background: linear-gradient(90deg, #808080, #b5b5b5);
 }
 
-#help-window .title-bar-text {
-    flex: 1;
-    align-self: stretch;
-    touch-action: none;
+.help-open #main-window > .title-bar .title-bar-text {
+    color: #dfdfdf;
 }
 
 .status-bar-field:first-child {
