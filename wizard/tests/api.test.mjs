@@ -154,7 +154,7 @@ test("HLS rewrite serves a fresh playlist; a failed size probe is optional", asy
     assert.equal(res.headers.get("content-range"), null);
     assert.notEqual(res.headers.get("etag"), '"old-etag"');
     assert.match(body, /127\.0\.0\.1:\d+\/itunnel\?id=/);
-    assert.equal(await probeInternalTunnel({ service: "bsky", url: source + "/probe-rejected.m3u8", isHLS: true }), undefined);
+    assert.equal(await probeInternalTunnel({ service: "bsky", url: source + "/probe-rejected.m3u8", isHLS: true }), -1);
 });
 
 test("chunked media streams all bytes and rejects empty media", async () => {
