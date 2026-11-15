@@ -10,7 +10,6 @@
     <link rel="stylesheet" href="style.css">
     <script src="config.js"></script>
     <script src="app.js" defer></script>
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
 </head>
 <body>
     <main class="window" id="main-window">
@@ -31,7 +30,7 @@
                            placeholder="https://www.instagram.com/reel/..." spellcheck="false">
                 </div>
 
-                <fieldset>
+                <fieldset id="modes">
                     <legend>Download mode</legend>
                     <div class="field-row">
                         <input id="mode-auto" type="radio" name="mode" value="auto" checked>
@@ -56,6 +55,13 @@
                             <option value="srt">Subtitles with timestamps (.srt)</option>
                         </select>
                     </div>
+                    <div class="field-row" id="audio-options" hidden>
+                        <label for="audio-format">Format</label>
+                        <select id="audio-format" disabled>
+                            <option value="mp3">MP3</option>
+                            <option value="best">Best available (format varies)</option>
+                        </select>
+                    </div>
                 </fieldset>
 
                 <section class="buttons">
@@ -64,11 +70,14 @@
                 </section>
             </form>
 
-            <section id="picker" hidden>
-                <p id="picker-title">This post has several items. Pick what to save:</p>
+            <p id="result" hidden><a id="save-file">Save file</a></p>
+
+            <section id="picker" aria-labelledby="picker-title" hidden>
+                <p id="picker-title" tabindex="-1">This post has several items. Pick what to save:</p>
                 <ul class="tree-view" id="picker-list"></ul>
                 <section class="buttons">
-                    <button type="button" id="picker-audio" hidden>Save audio</button>
+                    <a id="picker-audio" hidden>Save audio</a>
+                    <button type="button" id="picker-refresh">Refresh list</button>
                     <button type="button" id="picker-close">Close</button>
                 </section>
             </section>
@@ -76,12 +85,12 @@
             <div id="turnstile-widget"></div>
         </div>
         <div class="status-bar">
-            <p class="status-bar-field" id="status">Starting...</p>
+            <p class="status-bar-field" id="status" role="status">Starting...</p>
             <p class="status-bar-field" id="server">wizard</p>
         </div>
     </main>
 
-    <div class="window" id="help-window" role="dialog" aria-labelledby="help-title" hidden>
+    <dialog class="window" id="help-window" aria-labelledby="help-title">
         <div class="title-bar">
             <div class="title-bar-text" id="help-title">Help</div>
             <div class="title-bar-controls">
@@ -89,8 +98,8 @@
             </div>
         </div>
         <div class="window-body">
-            <p>Paste a link to a post and press Download. The file goes straight to this device; nothing is kept on the server.</p>
-            <p>Posts with several photos or videos open a list to pick from.</p>
+            <p>Paste a link to a post and press Download. If the download does not start, select Save file.</p>
+            <p>For posts with several files, pick what to save. If a link expires, select Refresh list.</p>
             <p>YouTube transcript saves existing captions as plain text or timed subtitles.</p>
             <p>Only save content you have the rights to.</p>
             <p>Powered by <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener">cobalt</a> (AGPL-3.0) &middot; <a href="https://github.com/AntoanBG3/cobalt/tree/wizard/wizard" target="_blank" rel="noopener">source</a>.</p>
@@ -98,6 +107,6 @@
                 <button type="button" id="help-ok">OK</button>
             </section>
         </div>
-    </div>
+    </dialog>
 </body>
 </html>

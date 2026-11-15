@@ -8,6 +8,9 @@ This branch (`wizard`) is not meant to be merged upstream.
 - `patches/` — fixes applied on top of upstream `main` when the API image is built.
   A patch that upstream has already merged is skipped automatically; one that no
   longer applies fails the build so it can be updated or dropped.
+  Run `bash wizard/apply-patches.sh /path/to/upstream` to reproduce the build step.
+  The diffs in `upstream-backports/` let the script recognize upstream changes
+  already carried by the full patch stack.
 - `page/` — a small Win98-style page that talks to a cobalt API (Turnstile sessions,
   tunnels, pickers). Styled with [98.css](https://github.com/jdan/98.css) (MIT).
   It replaces the stock cobalt web app, so no cobalt branding is used.
@@ -37,8 +40,13 @@ and on demand:
 | `ghcr.io/antoanbg3/cobalt-api:wizard` | upstream `main` + `patches/` |
 | `ghcr.io/antoanbg3/cobalt-page:wizard` | `page/` on nginx |
 
-Each build is also tagged with an immutable tag (`<version>-<upstream sha>-<fork sha>`
-for the API, the commit sha for the page) for rollbacks.
+The workflow tests both images before publishing either. Releases have a versioned
+tag (`<version>-<upstream sha>-<fork sha>` for the API, the commit SHA for the page)
+as well as the moving `wizard` tag. Both images include an HTTP health check.
+
+For a rollback, set the two Compose image tags to the last working pair from an
+earlier workflow run, then run `docker compose pull && docker compose up -d`
+in the stack directory.
 
 To test a local API image after applying `patches/`, run the fixture and caption
 tests from the fork root. They don't contact media providers:
@@ -48,8 +56,15 @@ docker run --rm --platform linux/amd64 --network none \
   -e API_URL=http://127.0.0.1:9900/ -e API_PORT=9900 \
   -v "$PWD/wizard/tests/api.test.mjs:/app/fixture.test.mjs:ro" \
   cobalt-wizard-review-api:local \
-  node --test --test-force-exit fixture.test.mjs src/processing/helpers/tests/captions.test.js
+  sh -c 'node --test --test-force-exit fixture.test.mjs src/processing/helpers/tests/captions.test.js test/*.test.js'
 ```
+
+The page smoke tests serve local API fixtures and mock Turnstile. To run them
+against a local page image, start it with
+`docker run --rm -p 127.0.0.1:9910:80 -e API_URL=http://127.0.0.1:9911 <page-image>`.
+With Playwright and Chromium installed, run `node --test wizard/tests/page.test.cjs`
+from the fork root. If Playwright is installed outside the fork, set `NODE_PATH`
+to its `node_modules` directory. Set `WIZARD_WEBKIT=1` to use WebKit.
 
 ## Compose sketch
 

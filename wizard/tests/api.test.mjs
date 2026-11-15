@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { before, test } from "node:test";
 import { createServer } from "node:http";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -10,6 +10,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import express from "express";
 import ffmpeg from "ffmpeg-static";
 import { Innertube } from "youtubei.js";
+import { request } from "undici";
 
 const api = "http://127.0.0.1:9900";
 const nativeFetch = globalThis.fetch;
@@ -17,6 +18,7 @@ const caption = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nA fixture &amp; a chec
 const media = Buffer.alloc(8000021, 42);
 const aac = mkdtempSync(join(tmpdir(), "cobalt-hls-"));
 let source, env, createStream, createInternalStream, probeInternalTunnel, chooseSoundcloud;
+const instagramGraphQL = [];
 
 const get = (url, options) => nativeFetch(url, { signal: AbortSignal.timeout(15000), ...options });
 const submit = async (url, data) => {
@@ -99,6 +101,18 @@ before(async () => {
 
     globalThis.fetch = async (input, init) => {
         const url = new URL(input?.url || input);
+        if (url.hostname === "i.instagram.com" && url.pathname === "/api/v1/oembed/")
+            return Response.json({}, { status: 400 });
+        if (url.hostname === "www.instagram.com") {
+            if (url.pathname.endsWith("/embed/captioned/")) return new Response('["init",[],[{}]],');
+            if (url.pathname.startsWith("/p/")) return new Response("");
+            if (url.pathname === "/graphql/query") {
+                const authenticated = Boolean(init.headers.cookie);
+                instagramGraphQL.push(authenticated);
+                if (!authenticated) return Response.json({ errors: [{ message: "Login required" }] }, { status: 401 });
+                return Response.json({ data: { xdt_shortcode_media: { video_url: source + "/video.mp4" } } });
+            }
+        }
         if (url.hostname === "api-http2.tumblr.com") return Response.json({
             response: { timeline: { elements: [{
                 content: [{ type: "image", media: [{ url: source + "/image.jpg", width: 900 }] }],
@@ -154,7 +168,7 @@ test("HLS rewrite serves a fresh playlist; a failed size probe is optional", asy
     assert.equal(res.headers.get("content-range"), null);
     assert.notEqual(res.headers.get("etag"), '"old-etag"');
     assert.match(body, /127\.0\.0\.1:\d+\/itunnel\?id=/);
-    assert.equal(await probeInternalTunnel({ service: "bsky", url: source + "/probe-rejected.m3u8", isHLS: true }), undefined);
+    assert.equal(await probeInternalTunnel({ service: "bsky", url: source + "/probe-rejected.m3u8", isHLS: true }), -1);
 });
 
 test("chunked media streams all bytes and rejects empty media", async () => {
@@ -175,6 +189,23 @@ test("FFmpeg empty output is a 500 without a download attachment", async () => {
     assert.equal(res.status, 500);
     assert.equal(res.headers.get("content-disposition"), null);
     await res.text();
+});
+
+test("proxy downloads omit attachments on failure and preserve byte ranges", async () => {
+    const tunnel = path => createStream({
+        url: source + path, service: "threads", type: "proxy", filename: "sample.mp4",
+    });
+    for (const [path, status] of [["/403", 403], ["/empty", 502]]) {
+        const res = await get(tunnel(path));
+        assert.equal(res.status, status);
+        assert.equal(res.headers.get("content-disposition"), null);
+        assert.match(await res.text(), /did not return a downloadable file/);
+    }
+    const res = await get(tunnel("/video.mp4"), { headers: { Range: "bytes=0-3" } });
+    assert.equal(res.status, 206);
+    assert.equal(res.headers.get("content-range"), `bytes 0-3/${media.length}`);
+    assert.match(res.headers.get("content-disposition"), /^attachment;/);
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), media.subarray(0, 4));
 });
 
 test("Tumblr carousel items honor alwaysProxy and download as attachments", async () => {
@@ -198,17 +229,35 @@ test("Facebook photo permalink returns a downloadable image", async () => {
     assert.equal(await (await get(body.url)).text(), "fixture-image");
 });
 
-test("SoundCloud prefers the highest AAC bitrate and produces decodable M4A", async () => {
-    const { body } = await submit("https://soundcloud.com/fixture/test", { downloadMode: "audio", audioFormat: "best" });
-    assert.equal(body.status, "tunnel", JSON.stringify(body));
-    assert.equal(chooseSoundcloud, "/high");
-    assert.match(body.filename, /\.m4a$/);
-    const res = await get(body.url);
-    assert.equal(res.status, 200);
-    const bytes = Buffer.from(await res.arrayBuffer());
-    const decoded = spawnSync(ffmpeg, ["-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"], { input: bytes });
-    assert.equal(decoded.status, 0, decoded.stderr?.toString());
-    assert.ok(decoded.stdout.length >= 150000);
+test("Instagram retries GraphQL with its configured session when the anonymous reply has no media", async () => {
+    const { loadFromFile } = await import("./src/processing/cookie/manager.js");
+    const cookieFile = join(aac, "instagram-fixture.json");
+    writeFileSync(cookieFile, JSON.stringify({ instagram: ["sessionid=fixture"] }));
+    await loadFromFile(cookieFile);
+
+    const { status, body } = await submit("https://www.instagram.com/reel/Fallback123/", { alwaysProxy: true });
+    assert.deepEqual(instagramGraphQL, [false, true]);
+    assert.equal(status, 200);
+    assert.equal(body.status, "tunnel");
+    assert.match(body.filename, /\.mp4$/);
+    const res = await get(body.url, { headers: { Range: "bytes=0-3" } });
+    assert.equal(res.status, 206);
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), media.subarray(0, 4));
+});
+
+test("SoundCloud prefers the highest AAC bitrate and saves decodable M4A or MP3", async () => {
+    for (const [audioFormat, extension] of [["best", ".m4a"], ["mp3", ".mp3"]]) {
+        const { body } = await submit("https://soundcloud.com/fixture/test", { downloadMode: "audio", audioFormat });
+        assert.equal(body.status, "tunnel", JSON.stringify(body));
+        assert.equal(chooseSoundcloud, "/high");
+        assert.ok(body.filename.endsWith(extension));
+        const res = await get(body.url);
+        assert.equal(res.status, 200);
+        const bytes = Buffer.from(await res.arrayBuffer());
+        const decoded = spawnSync(ffmpeg, ["-v", "error", "-i", "pipe:0", "-f", "s16le", "pipe:1"], { input: bytes });
+        assert.equal(decoded.status, 0, decoded.stderr?.toString());
+        assert.ok(decoded.stdout.length >= 150000);
+    }
 });
 
 test("YouTube caption requests download only TXT or SRT and report missing languages", async () => {
@@ -220,9 +269,21 @@ test("YouTube caption requests download only TXT or SRT and report missing langu
         const res = await get(body.url);
         assert.equal(res.status, 200);
         assert.match(res.headers.get("content-disposition"), /^attachment;/);
-        assert.equal(await res.text(), captionFormat === "txt"
+        assert.match(res.headers.get("content-type"), captionFormat === "txt"
+            ? /^text\/plain/ : /^application\/x-subrip/);
+        const text = captionFormat === "txt"
             ? "A fixture & a check\n"
-            : "1\n00:00:00,000 --> 00:00:02,000\nA fixture & a check\n");
+            : "1\n00:00:00,000 --> 00:00:02,000\nA fixture & a check\n";
+        assert.equal(await res.text(), text);
+
+        const navigation = await request(body.url, {
+            headers: { "Sec-Fetch-Mode": "navigate" },
+            signal: AbortSignal.timeout(15000),
+        });
+        assert.equal(navigation.statusCode, 200);
+        assert.match(navigation.headers["content-type"], /^application\/octet-stream/);
+        assert.match(navigation.headers.vary, /sec-fetch-mode/i);
+        assert.equal(await navigation.body.text(), text);
     }
     const missing = await submit(link, { downloadMode: "captions", captionLanguage: "bg" });
     assert.equal(missing.body.error.code, "error.api.captions.language_unavailable");

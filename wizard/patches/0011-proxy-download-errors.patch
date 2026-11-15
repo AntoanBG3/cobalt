@@ -1,0 +1,48 @@
+diff --git a/api/src/stream/proxy.js b/api/src/stream/proxy.js
+index d51927a9..5ad0c565 100644
+--- a/api/src/stream/proxy.js
++++ b/api/src/stream/proxy.js
+@@ -8,16 +8,16 @@ const defaultAgent = new Agent();
+
+ export default async function (streamInfo, res) {
+     const abortController = new AbortController();
+-    const shutdown = () => (
+-        closeRequest(abortController),
+-        closeResponse(res),
+-        destroyInternalStream(streamInfo.urls)
+-    );
++    const cleanup = () => {
++        closeRequest(abortController);
++        destroyInternalStream(streamInfo.urls);
++    };
++    const shutdown = () => {
++        cleanup();
++        closeResponse(res);
++    };
+
+     try {
+-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+-        res.setHeader('Content-disposition', contentDisposition(streamInfo.filename));
+-
+         const { body: stream, headers, statusCode } = await request(streamInfo.urls, {
+             headers: {
+                 ...getHeaders(streamInfo.service),
+@@ -28,9 +28,16 @@ export default async function (streamInfo, res) {
+             dispatcher: defaultAgent,
+         });
+
+-        res.status(statusCode);
++        if ((statusCode !== 200 && statusCode !== 206) || headers['content-length'] === '0') {
++            cleanup();
++            return res.status(statusCode >= 400 ? statusCode : 502)
++                .type('text/plain').send('The source did not return a downloadable file.');
++        }
+
+-        for (const headerName of ['accept-ranges', 'content-type', 'content-length']) {
++        res.status(statusCode);
++        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
++        res.setHeader('Content-Disposition', contentDisposition(streamInfo.filename));
++        for (const headerName of ['accept-ranges', 'content-type', 'content-length', 'content-range']) {
+             if (headers[headerName]) {
+                 res.setHeader(headerName, headers[headerName]);
+             }

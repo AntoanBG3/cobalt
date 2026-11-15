@@ -1,0 +1,18 @@
+diff --git a/api/src/processing/services/instagram.js b/api/src/processing/services/instagram.js
+index 173b3ae6..16ca60dd 100644
+--- a/api/src/processing/services/instagram.js
++++ b/api/src/processing/services/instagram.js
+@@ -423,9 +423,10 @@ export default function instagram(obj) {
+     }
+
+     async function getPost(id, alwaysProxy) {
+-        const hasData = (data) => data
+-                                    && data.gql_data !== null
+-                                    && data?.gql_data?.xdt_shortcode_media !== null;
++        const hasData = data => data && (
++            !Object.hasOwn(data, "gql_data") ||
++            Boolean(data.gql_data?.shortcode_media || data.gql_data?.xdt_shortcode_media)
++        );
+         let data, result;
+         try {
+             const cookie = getCookie('instagram');

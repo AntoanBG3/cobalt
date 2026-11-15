@@ -1,0 +1,513 @@
+diff --git a/api/src/stream/ffmpeg.js b/api/src/stream/ffmpeg.js
+index 8fea5451..39c8847f 100644
+--- a/api/src/stream/ffmpeg.js
++++ b/api/src/stream/ffmpeg.js
+@@ -1,12 +1,13 @@
+ import ffmpeg from "ffmpeg-static";
+ import { spawn } from "child_process";
+ import { once } from "node:events";
++import { pipeline } from "node:stream/promises";
+ import { create as contentDisposition } from "content-disposition-header";
+ 
+ import { env } from "../config.js";
+ import { destroyInternalStream } from "./manage.js";
+ import { hlsExceptions } from "../processing/service-config.js";
+-import { closeResponse, pipe, estimateTunnelLength, estimateAudioMultiplier } from "./shared.js";
++import { closeResponse, estimateTunnelLength, estimateAudioMultiplier } from "./shared.js";
+ 
+ const metadataTags = new Set([
+     "album",
+@@ -40,12 +41,10 @@ const convertMetadataToFFmpeg = (metadata) => {
+ }
+ 
+ const killProcess = (p) => {
+-    p?.kill('SIGTERM'); // ask the process to terminate itself gracefully
+-
+-    setTimeout(() => {
+-        if (p?.exitCode === null)
+-            p?.kill('SIGKILL'); // brutally murder the process if it didn't quit
+-    }, 5000);
++    if (!p?.pid || p.exitCode !== null || p.signalCode !== null) return;
++    p.kill('SIGTERM');
++    const timer = setTimeout(() => p.kill('SIGKILL'), 5000).unref();
++    p.once('exit', () => clearTimeout(timer));
+ }
+ 
+ const getCommand = (args) => {
+@@ -60,22 +59,26 @@ const render = async (res, streamInfo, ffargs, estimateMultiplier) => {
+     const urls = Array.isArray(streamInfo.urls) ? streamInfo.urls : [streamInfo.urls];
+     const probe = new AbortController();
+     let stopped = false;
+-    const shutdown = () => {
++    const finish = (success = false) => {
+         if (stopped) return;
+         stopped = true;
+         probe.abort();
+         killProcess(process);
+-        if (!res.destroyed) {
+-            if (!res.headersSent) {
+-                res.removeHeader('Content-Disposition');
+-                res.removeHeader('Estimated-Content-Length');
+-            }
++        urls.forEach(destroyInternalStream);
++
++        if (res.destroyed) return;
++        if (!res.headersSent) {
++            res.removeHeader('Content-Disposition');
++            res.removeHeader('Estimated-Content-Length');
+             closeResponse(res);
++        } else if (success) {
++            res.end();
++        } else {
++            res.destroy();
+         }
+-        urls.forEach(destroyInternalStream);
+     };
+-    if (res.destroyed) return shutdown();
+-    res.once('close', shutdown);
++    if (res.destroyed) return finish();
++    res.once('close', () => finish());
+ 
+     try {
+         const args = [
+@@ -91,7 +94,7 @@ const render = async (res, streamInfo, ffargs, estimateMultiplier) => {
+             ],
+         });
+ 
+-        process.once('error', shutdown);
++        const exitCode = once(process, 'close').then(([code]) => code, () => -1);
+         const [,,, muxOutput] = process.stdio;
+ 
+         res.setHeader('Connection', 'keep-alive');
+@@ -103,18 +106,19 @@ const render = async (res, streamInfo, ffargs, estimateMultiplier) => {
+         const estimatedLength = await Promise.race([
+             estimateTunnelLength(streamInfo, estimateMultiplier, signal).catch(() => -1),
+             once(muxOutput, 'readable', { signal }).then(() => -1),
++            exitCode.then(() => -1),
+         ]);
+         probe.abort();
+ 
+         if (stopped) return;
+         res.setHeader('Estimated-Content-Length', estimatedLength);
+ 
+-        // Keep the response open until shutdown can report an empty ffmpeg output as an error.
+-        pipe(muxOutput, res, shutdown, { end: false });
+-
+-        process.once('close', shutdown);
++        // Drain queued output before ending the HTTP response, but only mark
++        // the download complete if the renderer exits successfully.
++        const [code] = await Promise.all([exitCode, pipeline(muxOutput, res, { end: false })]);
++        finish(code === 0);
+     } catch {
+-        shutdown();
++        finish();
+     }
+ }
+ 
+diff --git a/api/src/stream/internal-hls.js b/api/src/stream/internal-hls.js
+index 4384452d..479b379f 100644
+--- a/api/src/stream/internal-hls.js
++++ b/api/src/stream/internal-hls.js
+@@ -2,25 +2,12 @@ import HLS from "hls-parser";
+ import { createInternalStream } from "./manage.js";
+ import { request } from "undici";
+ 
+-function getURL(url) {
+-    try {
+-        return new URL(url);
+-    } catch {
+-        return null;
+-    }
+-}
+-
+ function transformObject(streamInfo, hlsObject) {
+     if (hlsObject === undefined) {
+         return (object) => transformObject(streamInfo, object);
+     }
+ 
+-    let fullUrl;
+-    if (getURL(hlsObject.uri)) {
+-        fullUrl = new URL(hlsObject.uri);
+-    } else {
+-        fullUrl = new URL(hlsObject.uri, streamInfo.url);
+-    }
++    const fullUrl = new URL(hlsObject.uri, streamInfo.url);
+ 
+     if (fullUrl.hostname !== '127.0.0.1') {
+         hlsObject.uri = createInternalStream(fullUrl.toString(), streamInfo);
+@@ -54,13 +41,14 @@ function transformMediaPlaylist(streamInfo, hlsPlaylist) {
+     return hlsPlaylist;
+ }
+ 
+-const HLS_MIME_TYPES = ["application/vnd.apple.mpegurl", "audio/mpegurl", "application/x-mpegURL"];
++const HLS_MIME_TYPES = ["application/vnd.apple.mpegurl", "audio/mpegurl", "application/x-mpegurl"];
+ 
+ export function isHlsResponse(req, streamInfo) {
+-    return HLS_MIME_TYPES.includes(req.headers['content-type'])
++    const mime = req.headers['content-type']?.split(';', 1)[0].trim().toLowerCase();
++    return HLS_MIME_TYPES.includes(mime)
+         // bluesky's cdn responds with wrong content-type for the hls playlist,
+         // so we enforce it here until they fix it
+-        || (streamInfo.service === 'bsky' && streamInfo.url.endsWith('.m3u8'));
++        || (streamInfo.service === 'bsky' && new URL(streamInfo.url).pathname.endsWith('.m3u8'));
+ }
+ 
+ export async function handleHlsPlaylist(streamInfo, req, res) {
+diff --git a/api/src/stream/internal.js b/api/src/stream/internal.js
+index 4a8ab7c4..876900dc 100644
+--- a/api/src/stream/internal.js
++++ b/api/src/stream/internal.js
+@@ -8,6 +8,19 @@ const min = (a, b) => a < b ? a : b;
+ 
+ const serviceNeedsChunks = new Set(["youtube", "vk"]);
+ 
++function responseRangeLength(response, start, end, size) {
++    if (response.statusCode === 200 && start === 0n) return size;
++
++    const range = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(response.headers['content-range']);
++    if (response.statusCode !== 206 || !range) return 0n;
++
++    const first = BigInt(range[1]);
++    const last = BigInt(range[2]);
++    if (first !== start || last < first || last > end) return 0n;
++    if (range[3] !== '*' && BigInt(range[3]) !== size) return 0n;
++    return last - first + 1n;
++}
++
+ async function* readChunks(streamInfo, size) {
+     let read = 0n;
+     while (read < size) {
+@@ -42,22 +55,21 @@ async function* readChunks(streamInfo, size) {
+             break;
+         }
+ 
+-        const expected = min(CHUNK_SIZE, size - read);
+-        const received = BigInt(chunk.headers['content-length'] ?? 0);
+-
+-        // A source that ignores Range may only send a full body on the first request.
+-        if (!received || (chunk.statusCode === 200
+-            ? read !== 0n || received !== size
+-            : received > expected)) {
++        const length = responseRangeLength(chunk, read, end, size);
++        const contentLength = chunk.headers['content-length'];
++        if (!length || (contentLength != null && BigInt(contentLength) !== length)) {
+             await chunk.body.dump();
+-            throw new Error("unexpected media response length");
++            throw new Error("unexpected media response range");
+         }
+ 
++        let remaining = length;
+         for await (const data of chunk.body) {
++            remaining -= BigInt(data.length);
++            if (remaining < 0n) throw new Error("media response exceeds its range");
+             yield data;
+         }
+-
+-        read += received;
++        if (remaining !== 0n) throw new Error("incomplete media response range");
++        read += length;
+     }
+ }
+ 
+@@ -72,6 +84,9 @@ async function handleChunkedStream(streamInfo, res) {
+         closeRequest(streamInfo.controller);
+     };
+ 
++    res.once('close', () => closeRequest(streamInfo.controller));
++    if (res.destroyed) return cleanup();
++
+     try {
+         let req;
+         for (let attempts = 0; ; attempts++) {
+@@ -116,10 +131,19 @@ async function handleChunkedStream(streamInfo, res) {
+ }
+ 
+ async function handleGenericStream(streamInfo, res) {
+-    const { signal } = streamInfo.controller;
+-    const cleanup = () => res.end();
++    const client = new AbortController();
++    const signal = AbortSignal.any([streamInfo.controller.signal, client.signal]);
++    res.once('close', () => client.abort());
++    const cleanup = (error) => {
++        if (res.destroyed || res.writableEnded) return;
++        if (!error) return res.end();
++        res.removeHeader('content-length');
++        res.removeHeader('transfer-encoding');
++        closeResponse(res);
++    };
+ 
+     try {
++        if (res.destroyed) return;
+         const fileResponse = await request(streamInfo.url, {
+             headers: {
+                 ...Object.fromEntries(streamInfo.headers),
+@@ -133,7 +157,9 @@ async function handleGenericStream(streamInfo, res) {
+         res.status(fileResponse.statusCode);
+         fileResponse.body.on('error', () => {});
+ 
+-        const isHls = isHlsResponse(fileResponse, streamInfo);
++        const url = fileResponse.context?.history?.at(-1)?.href ?? streamInfo.url;
++        const responseInfo = { ...streamInfo, url };
++        const isHls = isHlsResponse(fileResponse, responseInfo);
+ 
+         for (const [ name, value ] of Object.entries(fileResponse.headers)) {
+             if (!isHls || name.toLowerCase() !== 'content-length') {
+@@ -142,17 +168,20 @@ async function handleGenericStream(streamInfo, res) {
+         }
+ 
+         if (fileResponse.statusCode < 200 || fileResponse.statusCode > 299) {
++            fileResponse.body.destroy();
++            res.removeHeader('content-length');
++            res.removeHeader('transfer-encoding');
+             return cleanup();
+         }
+ 
+         if (isHls) {
+-            await handleHlsPlaylist(streamInfo, fileResponse, res);
++            await handleHlsPlaylist(responseInfo, fileResponse, res);
+         } else {
+             pipe(fileResponse.body, res, cleanup);
+         }
+-    } catch {
+-        closeRequest(streamInfo.controller);
+-        cleanup();
++    } catch (error) {
++        client.abort();
++        cleanup(error);
+     }
+ }
+ 
+diff --git a/api/src/stream/shared.js b/api/src/stream/shared.js
+index f8df16b3..836540d6 100644
+--- a/api/src/stream/shared.js
++++ b/api/src/stream/shared.js
+@@ -43,14 +43,16 @@ export function getHeaders(service) {
+         .reduce((p, [key, val]) => ({ ...p, [key]: String(val) }), {})
+ }
+ 
+-export function pipe(from, to, done, options) {
+-    from.on('error', done)
+-        .on('close', done);
++export function pipe(from, to, done) {
++    from.on('error', error => {
++        if (to.headersSent && !to.writableEnded) to.destroy();
++        done(error);
++    }).on('close', done);
+ 
+     to.on('error', done)
+       .on('close', done);
+ 
+-    from.pipe(to, options);
++    from.pipe(to);
+ }
+ 
+ export async function estimateTunnelLength(streamInfo, multiplier = 1.1, signal) {
+diff --git a/api/src/stream/stream.js b/api/src/stream/stream.js
+index f47cd955..583e8978 100644
+--- a/api/src/stream/stream.js
++++ b/api/src/stream/stream.js
+@@ -8,10 +8,19 @@ import { destroyInternalStream } from "./manage.js";
+ 
+ export default async function(res, streamInfo) {
+     try {
+-        if (streamInfo.subtitles) {
+-            const releaseSubtitles = () => destroyInternalStream(streamInfo.subtitles);
+-            if (res.destroyed) releaseSubtitles();
+-            else res.once('close', releaseSubtitles);
++        const proxyURL = streamInfo.type === 'proxy' ? streamInfo.urls : null;
++        const { subtitles } = streamInfo;
++        if (proxyURL || subtitles) {
++            const release = () => {
++                if (proxyURL) destroyInternalStream(proxyURL);
++                if (subtitles) destroyInternalStream(subtitles);
++            };
++            if (res.destroyed) {
++                release();
++                if (proxyURL) return;
++            } else {
++                res.once('close', release);
++            }
+         }
+ 
+         switch (streamInfo.type) {
+diff --git a/api/test/download-correctness.test.js b/api/test/download-correctness.test.js
+new file mode 100644
+index 00000000..3b4ce2a3
+--- /dev/null
++++ b/api/test/download-correctness.test.js
+@@ -0,0 +1,133 @@
++import assert from "node:assert/strict";
++import { once } from "node:events";
++import { createServer } from "node:http";
++import { after, test } from "node:test";
++import express from "express";
++import { Agent, setGlobalDispatcher } from "undici";
++import { setTunnelPort } from "../src/config.js";
++import { internalStream } from "../src/stream/internal.js";
++import { createInternalStream, getInternalTunnel } from "../src/stream/manage.js";
++import stream from "../src/stream/stream.js";
++
++const dispatcher = new Agent();
++setGlobalDispatcher(dispatcher);
++after(() => dispatcher.destroy());
++
++async function serve(t, configure) {
++    const app = express();
++    const server = createServer(app);
++    server.listen(0);
++    t.after(() => {
++        server.close();
++        server.closeAllConnections();
++    });
++    await once(server, 'listening');
++    const { port } = server.address();
++    setTunnelPort(port);
++    const origin = `http://localhost:${port}`;
++    app.get('/itunnel', (req, res) => internalStream(getInternalTunnel(req.query.id), res));
++    configure(app, origin);
++    return origin;
++}
++
++test('closing a download before the origin sends headers cancels the origin request', async t => {
++    let started, closed;
++    const opened = new Promise(resolve => { started = resolve; });
++    const completed = new Promise(resolve => { closed = resolve; });
++    const origin = await serve(t, (app, origin) => {
++        app.get('/origin', (_, res) => {
++            const fallback = setTimeout(() => res.end('late file'), 700);
++            res.once('close', () => {
++                clearTimeout(fallback);
++                closed(res.writableFinished);
++            });
++            started();
++        });
++        app.get('/download', (_, res) => stream(res, {
++            type: 'proxy', urls: createInternalStream(origin + '/origin', { headers: {} }),
++            filename: 'video.mp4',
++        }));
++    });
++    const controller = new AbortController();
++    const pending = assert.rejects(fetch(origin + '/download', { signal: controller.signal }), {
++        name: 'AbortError',
++    });
++    await opened;
++    controller.abort();
++    await pending;
++    assert.equal(await completed, false);
++});
++
++test('an origin disconnect during a chunked download fails the transfer', async t => {
++    let interrupt;
++    const origin = await serve(t, (app, origin) => {
++        app.get('/origin', (_, res) => {
++            interrupt = () => res.destroy();
++            res.type('video/mp4').write('partial');
++        });
++        app.get('/download', (_, res) => stream(res, {
++            type: 'proxy', urls: createInternalStream(origin + '/origin', { headers: {} }),
++            filename: 'video.mp4',
++        }));
++    });
++    const response = await fetch(origin + '/download');
++    const reader = response.body.getReader();
++    assert.equal(Buffer.from((await reader.read()).value).toString(), 'partial');
++    interrupt();
++    await assert.rejects(reader.read());
++});
++
++test('checks the upstream range before forwarding bytes', async t => {
++    const origin = await serve(t, app => {
++        app.get('/video', (req, res) => {
++            if (req.method === 'HEAD') {
++                return res.set('Content-Length', '32').end();
++            }
++            res.status(206).set('Content-Range', 'bytes 32-63/64').send('x'.repeat(32));
++        });
++    });
++    const response = await fetch(createInternalStream(origin + '/video', { service: 'youtube' }));
++    assert.equal(response.status, 500);
++    await response.arrayBuffer();
++});
++
++test('accepts a valid partial response with chunked framing', async t => {
++    const origin = await serve(t, app => {
++        app.get('/video', (req, res) => {
++            if (req.method === 'HEAD') {
++                return res.set('Content-Length', '7').end();
++            }
++            res.status(206).set('Content-Range', 'bytes 0-6/7').write('fixture');
++            res.end();
++        });
++    });
++    const response = await fetch(createInternalStream(origin + '/video', { service: 'youtube' }));
++    assert.equal(response.status, 200);
++    assert.equal(await response.text(), 'fixture');
++});
++
++for (const [name, contentType, path, service] of [
++    ['redirected playlists resolve children against the final URL', 'application/vnd.apple.mpegurl', '/redirect'],
++    ['playlist media types accept casing and content-type parameters', 'Application/Vnd.Apple.Mpegurl; charset=utf-8', '/cdn/list.m3u8'],
++    ['Bluesky playlists tolerate query strings with an incorrect media type', 'application/octet-stream', '/cdn/list.m3u8?signed=fixture', 'bsky'],
++]) {
++    test(name, async t => {
++        const origin = await serve(t, app => {
++            app.get('/redirect', (_, res) => res.redirect('/cdn/list.m3u8'));
++            app.get('/cdn/list.m3u8', (_, res) => res.set('Content-Type', contentType).end(
++                '#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nsegment.ts\n#EXT-X-ENDLIST\n',
++            ));
++            app.get('/cdn/segment.ts', (_, res) => res.send('fixture segment'));
++        });
++        const response = await fetch(createInternalStream(
++            origin + path, { headers: {}, service },
++        ));
++        assert.equal(response.status, 200);
++        const playlist = await response.text();
++        const media = playlist.split('\n').find(line => line && !line.startsWith('#'));
++        assert.equal(new URL(media).pathname, '/itunnel');
++        const segment = await fetch(media);
++        assert.equal(segment.status, 200);
++        assert.equal(await segment.text(), 'fixture segment');
++    });
++}
+diff --git a/api/test/ffmpeg-failure.test.js b/api/test/ffmpeg-failure.test.js
+new file mode 100644
+index 00000000..eb864080
+--- /dev/null
++++ b/api/test/ffmpeg-failure.test.js
+@@ -0,0 +1,36 @@
++import assert from "node:assert/strict";
++import { once } from "node:events";
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { createServer } from "node:http";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { test } from "node:test";
++import express from "express";
++
++test('a failed FFmpeg process fails its partially streamed attachment', async t => {
++    const dir = await mkdtemp(join(tmpdir(), 'cobalt-render-'));
++    t.after(() => rm(dir, { recursive: true, force: true }));
++    process.env.FFMPEG_BIN = join(dir, 'ffmpeg');
++    // Simulate a renderer that starts an attachment and then cannot finish it.
++    await writeFile(process.env.FFMPEG_BIN, `#!${process.execPath}
++const { writeSync } = require('node:fs');
++writeSync(3, 'partial output');
++setTimeout(() => { process.exitCode = 1; }, 250);
++`, { mode: 0o755 });
++    const { default: ffmpeg } = await import("../src/stream/ffmpeg.js");
++    const app = express();
++    app.get('/download', (_, res) => ffmpeg.convertAudio({
++        urls: 'https://example.invalid/input.wav', filename: 'file.mp3', audioFormat: 'mp3',
++    }, res));
++    const server = createServer(app);
++    server.listen(0, '127.0.0.1');
++    t.after(() => {
++        server.close();
++        server.closeAllConnections();
++    });
++    await once(server, 'listening');
++    const response = await fetch(`http://127.0.0.1:${server.address().port}/download`);
++    const reader = response.body.getReader();
++    assert.equal(Buffer.from((await reader.read()).value).toString(), 'partial output');
++    await assert.rejects(reader.read());
++});

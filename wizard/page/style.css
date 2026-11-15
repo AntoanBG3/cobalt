@@ -45,6 +45,8 @@ fieldset {
 
 .buttons {
     display: flex;
+    align-items: center;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: 6px;
     margin-top: 12px;
@@ -100,12 +102,17 @@ button.default {
 /* Help opens over the page window, like a Win98 dialog over its parent */
 #help-window {
     position: fixed;
-    top: 96px;
-    left: 50%;
-    transform: translateX(-50%);
+    inset: 0;
+    margin: auto;
     box-sizing: border-box;
     width: min(380px, calc(100vw - 32px));
-    z-index: 10;
+    max-height: calc(100% - 24px);
+    overflow: auto;
+    border: 0;
+}
+
+#help-window::backdrop {
+    background: transparent;
 }
 
 .help-open #main-window > .title-bar {
@@ -116,11 +123,11 @@ button.default {
     color: #dfdfdf;
 }
 
-.status-bar-field:first-child {
+#status {
     flex: 3;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
 }
 
 [hidden] {
