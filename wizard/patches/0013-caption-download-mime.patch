@@ -1,0 +1,18 @@
+diff --git a/api/src/stream/captions.js b/api/src/stream/captions.js
+index 3f23c899..502f3cd4 100644
+--- a/api/src/stream/captions.js
++++ b/api/src/stream/captions.js
+@@ -64,7 +64,12 @@ export default async function captions(streamInfo, res) {
+
+         res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+         res.setHeader("Content-Disposition", contentDisposition(streamInfo.filename));
+-        res.setHeader("Content-Type", contentTypes[streamInfo.captionFormat]);
++        // WebKit can preview a text attachment opened by a download link.
++        const type = res.req.get("Sec-Fetch-Mode") === "navigate"
++            ? "application/octet-stream"
++            : contentTypes[streamInfo.captionFormat];
++        res.vary("Sec-Fetch-Mode");
++        res.setHeader("Content-Type", type);
+         res.setHeader("Content-Length", Buffer.byteLength(body));
+         res.status(200).send(body);
+     } catch {
