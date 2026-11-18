@@ -1,5 +1,5 @@
 diff --git a/api/src/stream/ffmpeg.js b/api/src/stream/ffmpeg.js
-index 4a72a309278160acceeb423d6d50905330127cf1..ba5c4fa194782d3ebc61fd3a9b3b8a6ade53ad5e 100644
+index 4a72a309..ba5c4fa1 100644
 --- a/api/src/stream/ffmpeg.js
 +++ b/api/src/stream/ffmpeg.js
 @@ -1,5 +1,6 @@
@@ -63,7 +63,7 @@ index 4a72a309278160acceeb423d6d50905330127cf1..ba5c4fa194782d3ebc61fd3a9b3b8a6a
          pipe(muxOutput, res, shutdown);
  
 diff --git a/api/src/stream/internal.js b/api/src/stream/internal.js
-index aa8333aee7fae8c811b47a0feeed6a9cca3757c0..c70a7aa8c82f782c779a5999e38ff944cc45deb4 100644
+index aa8333ae..c70a7aa8 100644
 --- a/api/src/stream/internal.js
 +++ b/api/src/stream/internal.js
 @@ -155,9 +155,10 @@ export function internalStream(streamInfo, res) {
@@ -80,7 +80,7 @@ index aa8333aee7fae8c811b47a0feeed6a9cca3757c0..c70a7aa8c82f782c779a5999e38ff944
              ...Object.fromEntries(streamInfo.headers || []),
              ...getHeaders(streamInfo.service),
 diff --git a/api/src/stream/shared.js b/api/src/stream/shared.js
-index 6d2685641a4d3ed0e6ea83c677a02ca3560dff45..7e03bf27fddcf7b00daea239215fdf241a3a2b33 100644
+index 6d268564..7e03bf27 100644
 --- a/api/src/stream/shared.js
 +++ b/api/src/stream/shared.js
 @@ -53,7 +53,7 @@ export function pipe(from, to, done) {
@@ -103,10 +103,10 @@ index 6d2685641a4d3ed0e6ea83c677a02ca3560dff45..7e03bf27fddcf7b00daea239215fdf24
          // bold guess that it's the same size as the existing one
 diff --git a/api/test/ffmpeg-stream.test.js b/api/test/ffmpeg-stream.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..6c398bb2ab513123802f3f633dd436667b6ae3e8
+index 00000000..052362f9
 --- /dev/null
 +++ b/api/test/ffmpeg-stream.test.js
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,105 @@
 +import assert from "node:assert/strict";
 +import { once } from "node:events";
 +import { createServer } from "node:http";
@@ -188,16 +188,14 @@ index 0000000000000000000000000000000000000000..6c398bb2ab513123802f3f633dd43666
 +    assert.equal(audio.toString('ascii', 0, 3), 'ID3');
 +    assert.ok(audio.length > 1000);
 +    assert.equal(await probeDone, false);
-+});
 +
-+test('sends a completed estimate if it is ready before the media', async t => {
-+    const { url, probeDone } = await setup(t, { probeDelay: 0, mediaDelay: 150 });
-+    const response = await fetch(url);
++    const fast = await setup(t, { probeDelay: 0, mediaDelay: 150 });
++    const estimated = await fetch(fast.url);
 +
-+    assert.equal(response.status, 200);
-+    assert.equal(response.headers.get('Estimated-Content-Length'), '4412');
-+    assert.ok((await response.arrayBuffer()).byteLength > 1000);
-+    assert.equal(await probeDone, true);
++    assert.equal(estimated.status, 200);
++    assert.equal(estimated.headers.get('Estimated-Content-Length'), '4412');
++    assert.deepEqual(Buffer.from(await estimated.arrayBuffer()), audio);
++    assert.equal(await fast.probeDone, true);
 +});
 +
 +test('cancels media and size requests when the client disconnects', async t => {
@@ -214,3 +212,16 @@ index 0000000000000000000000000000000000000000..6c398bb2ab513123802f3f633dd43666
 +    assert.equal(await probeDone, false);
 +    assert.equal(await mediaDone, false);
 +});
+diff --git a/docs/api.md b/docs/api.md
+index 4ad2839b..af00fa09 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -237,7 +237,7 @@ endpoint for file tunnels (proxy/remux/transcode). the response is a file stream
+ - `Content-Length`: file size, in bytes. returned when exact final file size is known.
+ - `Estimated-Content-Length`: estimated file size, in bytes. returned when real `Content-Length` is not known.
+ a rough estimate which should NOT be used for strict size verification.
+-can be used to show approximate download progress in UI.
++a positive value can be used for approximate download progress. `-1` means the estimate was unavailable when streaming began. clients should show indeterminate progress in that case.
+ 
+ ### possible HTTP status codes
+ - 200: OK

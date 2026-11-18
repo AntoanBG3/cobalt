@@ -29,6 +29,10 @@ This branch (`wizard`) is not meant to be merged upstream.
 | [#1533](https://github.com/imputnet/cobalt/pull/1533) | Ignore a missing (`null`) Facebook HD or SD link instead of matching another video's link further down the page. |
 | [#1546](https://github.com/imputnet/cobalt/pull/1546) | Download Bluesky videos that have no audio track (the ffmpeg audio map is optional). The playlist header part is already in 0002. |
 | [#1558](https://github.com/imputnet/cobalt/pull/1558) | Support Threads posts (`threads.com` and `threads.net`): videos, photos, GIFs and carousels. |
+| [#1619](https://github.com/imputnet/cobalt/pull/1619) | Try the Instagram web fallback for publicly resolved posts and continue when the response contains only a video cover. |
+| [#1620](https://github.com/imputnet/cobalt/pull/1620) | Bound HLS probes to a one-byte range and weight the estimate by sampled duration. |
+| [#1621](https://github.com/imputnet/cobalt/pull/1621) | Stream FFmpeg output as soon as it is ready. An estimated size of `-1` indicates unknown length. |
+| [#1622](https://github.com/imputnet/cobalt/pull/1622) | Clean up subtitle inputs on completion and disconnect, including before dispatch. |
 
 ## Images
 

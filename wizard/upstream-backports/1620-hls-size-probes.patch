@@ -1,5 +1,5 @@
 diff --git a/api/src/stream/internal-hls.js b/api/src/stream/internal-hls.js
-index b56c93ffefb83da8d143294c55595fcb1368ddc7..f1e52b073639a8f753faf93fb877f1eb10f8599f 100644
+index b56c93ff..c7eebdcb 100644
 --- a/api/src/stream/internal-hls.js
 +++ b/api/src/stream/internal-hls.js
 @@ -77,25 +77,22 @@ export async function handleHlsPlaylist(streamInfo, req, res) {
@@ -39,7 +39,7 @@ index b56c93ffefb83da8d143294c55595fcb1368ddc7..f1e52b073639a8f753faf93fb877f1eb
  }
  
  export async function probeInternalHLSTunnel(streamInfo) {
-@@ -107,35 +104,41 @@ export async function probeInternalHLSTunnel(streamInfo) {
+@@ -107,35 +104,43 @@ export async function probeInternalHLSTunnel(streamInfo) {
      });
  
      const config = { headers, dispatcher, signal, maxRedirections: 16 };
@@ -86,25 +86,28 @@ index b56c93ffefb83da8d143294c55595fcb1368ddc7..f1e52b073639a8f753faf93fb877f1eb
 -
 -            const segmentSize = await getSegmentSize(segmentUrl, config) / randomSegment.duration;
 -            return segmentSize;
-+            return size / segment.duration;
++            return { size, duration: segment.duration };
          })
      );
  
 -    const averageBitrate = segmentSamples.reduce((a, b) => a + b) / segmentSamples.length;
 -    const totalDuration = manifest.segments.reduce((acc, segment) => acc + segment.duration, 0);
-+    const bitrates = samples
-+        .filter(sample => sample.status === 'fulfilled'
-+                       && Number.isFinite(sample.value) && sample.value > 0)
-+        .map(sample => sample.value);
-+    if (!bitrates.length)
-+        return -1;
++    let sampledBytes = 0, sampledDuration = 0;
++    for (const sample of samples) {
++        if (sample.status !== 'fulfilled') continue;
++        const { size, duration } = sample.value;
++        if (!Number.isFinite(size) || size <= 0) continue;
++        sampledBytes += size;
++        sampledDuration += duration;
++    }
++    if (!sampledDuration) return -1;
  
-+    const averageBitrate = bitrates.reduce((a, b) => a + b) / bitrates.length;
+-    return averageBitrate * totalDuration;
 +    const totalDuration = segments.reduce((acc, segment) => acc + segment.duration, 0);
-     return averageBitrate * totalDuration;
++    return sampledBytes * (totalDuration / sampledDuration);
  }
 diff --git a/api/src/stream/internal.js b/api/src/stream/internal.js
-index aa8333aee7fae8c811b47a0feeed6a9cca3757c0..32d346561e1d2f0ac5913f8bf7fb590ba6daa086 100644
+index aa8333ae..32d34656 100644
 --- a/api/src/stream/internal.js
 +++ b/api/src/stream/internal.js
 @@ -166,7 +166,7 @@ export async function probeInternalTunnel(streamInfo) {
@@ -118,7 +121,7 @@ index aa8333aee7fae8c811b47a0feeed6a9cca3757c0..32d346561e1d2f0ac5913f8bf7fb590b
                  headers
 diff --git a/api/test/hls-probe.test.js b/api/test/hls-probe.test.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd1f7d11d7e448a5404275085affe2288d7b1c62
+index 00000000..65fdb52f
 --- /dev/null
 +++ b/api/test/hls-probe.test.js
 @@ -0,0 +1,89 @@
@@ -133,15 +136,15 @@ index 0000000000000000000000000000000000000000..fd1f7d11d7e448a5404275085affe228
 +setGlobalDispatcher(dispatcher);
 +after(() => dispatcher.destroy());
 +
-+async function setup(t, segments, serveSegment) {
++async function setup(t, segments, serveSegment, durations = []) {
 +    const server = createServer((req, res) => {
 +        if (req.url === '/redirect') {
 +            return res.writeHead(302, { location: '/media/list.m3u8' }).end();
 +        }
 +        if (req.url === '/media/list.m3u8') {
 +            return res.end([
-+                '#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:4',
-+                ...segments.flatMap(segment => ['#EXTINF:4,', segment]),
++                '#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:9',
++                ...segments.flatMap((segment, i) => [`#EXTINF:${durations[i] ?? 4},`, segment]),
 +                '#EXT-X-ENDLIST', '',
 +            ].join('\n'));
 +        }
@@ -180,7 +183,7 @@ index 0000000000000000000000000000000000000000..fd1f7d11d7e448a5404275085affe228
 +    ], (req, res) => {
 +        requests.push(req.url);
 +        res.writeHead(500).end();
-+    });
++    }, [1, 9]);
 +
 +    assert.equal(await probe(), 6000);
 +    assert.deepEqual(requests, []);

@@ -1,0 +1,277 @@
+diff --git a/api/src/processing/services/instagram.js b/api/src/processing/services/instagram.js
+index 16ca60dd..d7b59324 100644
+--- a/api/src/processing/services/instagram.js
++++ b/api/src/processing/services/instagram.js
+@@ -435,7 +435,8 @@ export default function instagram(obj) {
+             const token = bearer?.values()?.token;
+ 
+             // get media_id for mobile api, three methods
+-            let media_id = await getMediaId(id);
++            const publicMediaId = await getMediaId(id);
++            let media_id = publicMediaId;
+             if (!media_id && token) media_id = await getMediaId(id, { token });
+             if (!media_id && cookie) media_id = await getMediaId(id, { cookie });
+ 
+@@ -447,7 +448,18 @@ export default function instagram(obj) {
+             if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
+ 
+             // web api (cookie), in case the mobile api rejects the cookie session
+-            if (media_id && cookie && !hasData(data)) data = await requestWebApi(media_id, cookie);
++            if (publicMediaId && cookie && !hasData(data)) {
++                const item = await requestWebApi(publicMediaId, cookie);
++                if (item?.user?.is_private) return { error: "content.post.private" };
++                if (item && (item.media_type !== 2 || item.video_versions?.length)) {
++                    try {
++                        const post = extractNewPost(item, id, alwaysProxy);
++                        if (post?.urls || post?.picker?.length) return post;
++                    } catch {
++                        // Incomplete media items can still be resolved by the embed.
++                    }
++                }
++            }
+ 
+             // html embed (no cookie, cookie)
+             if (!hasData(data)) data = await requestHTML(id);
+diff --git a/api/src/stream/internal-hls.js b/api/src/stream/internal-hls.js
+index 479b379f..25dcc122 100644
+--- a/api/src/stream/internal-hls.js
++++ b/api/src/stream/internal-hls.js
+@@ -139,18 +139,20 @@ export async function probeInternalHLSTunnel(streamInfo) {
+                 }
+                 size = await sizeRequests.get(segmentUrl);
+             }
+-            return size / segment.duration;
++            return { size, duration: segment.duration };
+         })
+     );
+ 
+-    const bitrates = samples
+-        .filter(sample => sample.status === 'fulfilled'
+-                       && Number.isFinite(sample.value) && sample.value > 0)
+-        .map(sample => sample.value);
+-    if (!bitrates.length)
+-        return -1;
++    let sampledBytes = 0, sampledDuration = 0;
++    for (const sample of samples) {
++        if (sample.status !== 'fulfilled') continue;
++        const { size, duration } = sample.value;
++        if (!Number.isFinite(size) || size <= 0) continue;
++        sampledBytes += size;
++        sampledDuration += duration;
++    }
++    if (!sampledDuration) return -1;
+ 
+-    const averageBitrate = bitrates.reduce((a, b) => a + b) / bitrates.length;
+     const totalDuration = segments.reduce((acc, segment) => acc + segment.duration, 0);
+-    return averageBitrate * totalDuration;
++    return sampledBytes * (totalDuration / sampledDuration);
+ }
+diff --git a/api/src/stream/stream.js b/api/src/stream/stream.js
+index 583e8978..96201ec8 100644
+--- a/api/src/stream/stream.js
++++ b/api/src/stream/stream.js
+@@ -17,7 +17,8 @@ export default async function(res, streamInfo) {
+             };
+             if (res.destroyed) {
+                 release();
+-                if (proxyURL) return;
++                if (!proxyURL) [streamInfo.urls].flat().forEach(destroyInternalStream);
++                return;
+             } else {
+                 res.once('close', release);
+             }
+diff --git a/api/test/ffmpeg-stream.test.js b/api/test/ffmpeg-stream.test.js
+index 6c398bb2..052362f9 100644
+--- a/api/test/ffmpeg-stream.test.js
++++ b/api/test/ffmpeg-stream.test.js
+@@ -79,16 +79,14 @@ test('starts a ready MP3 download while the size probe is pending', async t => {
+     assert.equal(audio.toString('ascii', 0, 3), 'ID3');
+     assert.ok(audio.length > 1000);
+     assert.equal(await probeDone, false);
+-});
+ 
+-test('sends a completed estimate if it is ready before the media', async t => {
+-    const { url, probeDone } = await setup(t, { probeDelay: 0, mediaDelay: 150 });
+-    const response = await fetch(url);
++    const fast = await setup(t, { probeDelay: 0, mediaDelay: 150 });
++    const estimated = await fetch(fast.url);
+ 
+-    assert.equal(response.status, 200);
+-    assert.equal(response.headers.get('Estimated-Content-Length'), '4412');
+-    assert.ok((await response.arrayBuffer()).byteLength > 1000);
+-    assert.equal(await probeDone, true);
++    assert.equal(estimated.status, 200);
++    assert.equal(estimated.headers.get('Estimated-Content-Length'), '4412');
++    assert.deepEqual(Buffer.from(await estimated.arrayBuffer()), audio);
++    assert.equal(await fast.probeDone, true);
+ });
+ 
+ test('cancels media and size requests when the client disconnects', async t => {
+diff --git a/api/test/hls-probe.test.js b/api/test/hls-probe.test.js
+index fd1f7d11..65fdb52f 100644
+--- a/api/test/hls-probe.test.js
++++ b/api/test/hls-probe.test.js
+@@ -9,15 +9,15 @@ const dispatcher = new Agent();
+ setGlobalDispatcher(dispatcher);
+ after(() => dispatcher.destroy());
+ 
+-async function setup(t, segments, serveSegment) {
++async function setup(t, segments, serveSegment, durations = []) {
+     const server = createServer((req, res) => {
+         if (req.url === '/redirect') {
+             return res.writeHead(302, { location: '/media/list.m3u8' }).end();
+         }
+         if (req.url === '/media/list.m3u8') {
+             return res.end([
+-                '#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:4',
+-                ...segments.flatMap(segment => ['#EXTINF:4,', segment]),
++                '#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:9',
++                ...segments.flatMap((segment, i) => [`#EXTINF:${durations[i] ?? 4},`, segment]),
+                 '#EXT-X-ENDLIST', '',
+             ].join('\n'));
+         }
+@@ -56,7 +56,7 @@ test('uses HLS byte-range lengths without fetching the media', async t => {
+     ], (req, res) => {
+         requests.push(req.url);
+         res.writeHead(500).end();
+-    });
++    }, [1, 9]);
+ 
+     assert.equal(await probe(), 6000);
+     assert.deepEqual(requests, []);
+diff --git a/api/test/instagram-web.test.js b/api/test/instagram-web.test.js
+new file mode 100644
+index 00000000..711aa0d6
+--- /dev/null
++++ b/api/test/instagram-web.test.js
+@@ -0,0 +1,45 @@
++import assert from "node:assert/strict";
++import { mkdtemp, writeFile, rm } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { test } from "node:test";
++import instagram from "../src/processing/services/instagram.js";
++import { loadFromFile } from "../src/processing/cookie/manager.js";
++
++test('web fallback for a publicly resolvable reel', async t => {
++    const dir = await mkdtemp(join(tmpdir(), 'cobalt-instagram-'));
++    t.after(() => rm(dir, { recursive: true, force: true }));
++    const cookies = join(dir, 'cookies.json');
++    await writeFile(cookies, JSON.stringify({ instagram: ['test=fixture'] }));
++    t.mock.method(globalThis, 'setInterval', () => 1);
++    await loadFromFile(cookies);
++
++    let item;
++    let embedRequests = 0;
++    const video = 'https://example.invalid/reel.mp4';
++    t.mock.method(globalThis, 'fetch', async input => {
++        const url = new URL(input);
++        if (url.pathname.includes('/oembed/')) return Response.json({ media_id: '1' });
++        if (url.hostname === 'i.instagram.com') return Response.json({ status: 'fail' });
++        if (url.pathname.endsWith('/info/')) return Response.json({ items: [item] });
++        if (url.pathname.endsWith('/embed/captioned/')) {
++            embedRequests++;
++            const data = { gql_data: { shortcode_media: { video_url: video } } };
++            const embed = JSON.stringify({ contextJSON: JSON.stringify(data) });
++            return new Response(`"init",[],[${embed}]],`);
++        }
++        throw new Error('unexpected request');
++    });
++
++    item = { media_type: 2, video_versions: [{ url: video, width: 32, height: 32 }] };
++    assert.equal((await instagram({ postId: 'fixture' })).urls, video);
++    assert.equal(embedRequests, 0);
++
++    item = { media_type: 2, image_versions2: { candidates: [{ url: 'cover.jpg' }] } };
++    assert.equal((await instagram({ postId: 'fixture' })).urls, video);
++    assert.equal(embedRequests, 1);
++
++    item = { user: { is_private: true }, video_versions: [{ url: video }] };
++    assert.deepEqual(await instagram({ postId: 'fixture' }), { error: 'content.post.private' });
++    assert.equal(embedRequests, 1);
++});
+diff --git a/api/test/subtitle-tunnel.test.js b/api/test/subtitle-tunnel.test.js
+index dd458d11..e1e6685a 100644
+--- a/api/test/subtitle-tunnel.test.js
++++ b/api/test/subtitle-tunnel.test.js
+@@ -8,10 +8,10 @@ import ffmpeg from "ffmpeg-static";
+ import { Agent, setGlobalDispatcher } from "undici";
+ import { env, setTunnelPort } from "../src/config.js";
+ import { internalStream } from "../src/stream/internal.js";
+-import { createStream, getInternalTunnel, getInternalTunnelFromURL, verifyStream } from "../src/stream/manage.js";
++import { createInternalStream, createStream, getInternalTunnel, getInternalTunnelFromURL, verifyStream } from "../src/stream/manage.js";
+ import stream from "../src/stream/stream.js";
+ 
+-test('releases the subtitle tunnel after a subtitled MP4 download', async t => {
++test('releases subtitle tunnels after completed and interrupted downloads', { timeout: 20000 }, async t => {
+     const input = spawnSync(ffmpeg, [
+         '-v', 'error', '-f', 'lavfi', '-i', 'color=s=32x32:d=1',
+         '-f', 'lavfi', '-i', 'anullsrc', '-shortest', '-c:v', 'libx264',
+@@ -39,19 +39,20 @@ test('releases the subtitle tunnel after a subtitled MP4 download', async t => {
+     ));
+     app.get('/itunnel', (req, res) => internalStream(getInternalTunnel(req.query.id), res));
+ 
+-    let wrapped;
++    let wrapped, responseClosed;
+     app.get('/tunnel', async (req, res) => {
+         const { id, sig, exp, sec, iv } = req.query;
+         wrapped = await verifyStream(id, sig, exp, sec, iv);
++        responseClosed = once(res, 'close');
+         return stream(res, wrapped);
+     });
+ 
+-    const url = createStream({
++    const fixture = {
+         type: 'remux', service: 'loom', filename: 'subtitled.mp4', headers: {},
+         url: new URL('/video.mp4', env.apiURL).href,
+         subtitles: new URL('/subtitles.vtt', env.apiURL).href,
+-    });
+-    const response = await fetch(url);
++    };
++    const response = await fetch(createStream(fixture));
+     assert.equal(response.status, 200);
+     const output = Buffer.from(await response.arrayBuffer());
+     const subtitle = spawnSync(ffmpeg, [
+@@ -61,4 +62,29 @@ test('releases the subtitle tunnel after a subtitled MP4 download', async t => {
+     assert.match(subtitle.stdout.toString(), /Fixture subtitle/);
+     assert.equal(getInternalTunnelFromURL(wrapped.urls), undefined);
+     assert.equal(getInternalTunnelFromURL(wrapped.subtitles), undefined);
++
++    // Abort a second download while FFmpeg is waiting for the media body.
++    app.get('/pending.mp4', (req, res) => {
++        if (req.method === 'HEAD') return res.sendStatus(200);
++        server.emit('media-pending');
++    });
++    const pending = once(server, 'media-pending');
++    const controller = new AbortController();
++    const url = createStream({ ...fixture, url: new URL('/pending.mp4', env.apiURL).href });
++    const aborted = assert.rejects(fetch(url, { signal: controller.signal }), { name: 'AbortError' });
++    await pending;
++    assert.ok(getInternalTunnelFromURL(wrapped.subtitles));
++    controller.abort();
++    await Promise.all([aborted, responseClosed]);
++    assert.equal(getInternalTunnelFromURL(wrapped.subtitles), undefined);
++});
++
++test('releases inputs before dispatch if the client already disconnected', async () => {
++    setTunnelPort(8192);
++    const media = createInternalStream('https://example.invalid/video.mp4');
++    const subtitles = createInternalStream('https://example.invalid/subtitles.vtt');
++    const response = { destroyed: true };
++    await stream(response, { type: 'remux', urls: media, subtitles });
++    assert.equal(getInternalTunnelFromURL(media), undefined);
++    assert.equal(getInternalTunnelFromURL(subtitles), undefined);
+ });
+diff --git a/docs/api.md b/docs/api.md
+index 4ad2839b..af00fa09 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -237,7 +237,7 @@ endpoint for file tunnels (proxy/remux/transcode). the response is a file stream
+ - `Content-Length`: file size, in bytes. returned when exact final file size is known.
+ - `Estimated-Content-Length`: estimated file size, in bytes. returned when real `Content-Length` is not known.
+ a rough estimate which should NOT be used for strict size verification.
+-can be used to show approximate download progress in UI.
++a positive value can be used for approximate download progress. `-1` means the estimate was unavailable when streaming began. clients should show indeterminate progress in that case.
+ 
+ ### possible HTTP status codes
+ - 200: OK
