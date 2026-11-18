@@ -1,8 +1,35 @@
 diff --git a/api/src/processing/services/instagram.js b/api/src/processing/services/instagram.js
-index 16ca60dd..d7b59324 100644
+index 16ca60dd..8ee0d781 100644
 --- a/api/src/processing/services/instagram.js
 +++ b/api/src/processing/services/instagram.js
-@@ -435,7 +435,8 @@ export default function instagram(obj) {
+@@ -135,13 +135,19 @@ export default function instagram(obj) {
+         return mediaInfo?.items?.[0];
+     }
+ 
+-    async function requestWebApi(mediaId, cookie) {
+-        const mediaInfo = await request(
+-            `https://www.instagram.com/api/v1/media/${mediaId}/info/`,
+-            cookie
+-        ).catch(() => {});
+-
+-        return mediaInfo?.items?.[0];
++    async function requestWebPost(mediaId, cookie, id, alwaysProxy) {
++        try {
++            const response = await request(`https://www.instagram.com/api/v1/media/${mediaId}/info/`, cookie);
++            const item = response?.items?.[0];
++            if (!item) return;
++            if (item.user?.is_private) return { error: 'content.post.private' };
++            if (item.media_type === 2 && !item.video_versions?.length) return;
++
++            const post = extractNewPost(item, id, alwaysProxy);
++            if (post?.urls || post?.picker?.length) return post;
++        } catch {
++            // The embed can still resolve malformed or incomplete web responses.
++        }
+     }
+ 
+     async function requestHTML(id, cookie) {
+@@ -435,7 +441,8 @@ export default function instagram(obj) {
              const token = bearer?.values()?.token;
  
              // get media_id for mobile api, three methods
@@ -12,22 +39,14 @@ index 16ca60dd..d7b59324 100644
              if (!media_id && token) media_id = await getMediaId(id, { token });
              if (!media_id && cookie) media_id = await getMediaId(id, { cookie });
  
-@@ -447,7 +448,18 @@ export default function instagram(obj) {
+@@ -447,7 +454,10 @@ export default function instagram(obj) {
              if (media_id && cookie && !hasData(data)) data = await requestMobileApi(media_id, { cookie });
  
              // web api (cookie), in case the mobile api rejects the cookie session
 -            if (media_id && cookie && !hasData(data)) data = await requestWebApi(media_id, cookie);
 +            if (publicMediaId && cookie && !hasData(data)) {
-+                const item = await requestWebApi(publicMediaId, cookie);
-+                if (item?.user?.is_private) return { error: "content.post.private" };
-+                if (item && (item.media_type !== 2 || item.video_versions?.length)) {
-+                    try {
-+                        const post = extractNewPost(item, id, alwaysProxy);
-+                        if (post?.urls || post?.picker?.length) return post;
-+                    } catch {
-+                        // Incomplete media items can still be resolved by the embed.
-+                    }
-+                }
++                const post = await requestWebPost(publicMediaId, cookie, id, alwaysProxy);
++                if (post) return post;
 +            }
  
              // html embed (no cookie, cookie)
@@ -141,10 +160,10 @@ index fd1f7d11..65fdb52f 100644
      assert.deepEqual(requests, []);
 diff --git a/api/test/instagram-web.test.js b/api/test/instagram-web.test.js
 new file mode 100644
-index 00000000..711aa0d6
+index 00000000..baf3fc7e
 --- /dev/null
 +++ b/api/test/instagram-web.test.js
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +import assert from "node:assert/strict";
 +import { mkdtemp, writeFile, rm } from "node:fs/promises";
 +import { tmpdir } from "node:os";
@@ -164,7 +183,7 @@ index 00000000..711aa0d6
 +    let item;
 +    let embedRequests = 0;
 +    const video = 'https://example.invalid/reel.mp4';
-+    t.mock.method(globalThis, 'fetch', async input => {
++    const fixtureResponse = input => {
 +        const url = new URL(input);
 +        if (url.pathname.includes('/oembed/')) return Response.json({ media_id: '1' });
 +        if (url.hostname === 'i.instagram.com') return Response.json({ status: 'fail' });
@@ -176,7 +195,8 @@ index 00000000..711aa0d6
 +            return new Response(`"init",[],[${embed}]],`);
 +        }
 +        throw new Error('unexpected request');
-+    });
++    };
++    t.mock.method(globalThis, 'fetch', input => Promise.resolve(fixtureResponse(input)));
 +
 +    item = { media_type: 2, video_versions: [{ url: video, width: 32, height: 32 }] };
 +    assert.equal((await instagram({ postId: 'fixture' })).urls, video);
