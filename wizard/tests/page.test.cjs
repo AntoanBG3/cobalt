@@ -88,6 +88,15 @@ browserTest("a file handoff leaves the form and its recovery link in place", asy
     await submitWithoutActivation(page);
     await waitStatus(page, "File ready: sample.txt");
     const save = page.getByRole("link", { name: "Save file" });
+    for (const width of [320, 1024]) {
+        await page.setViewportSize({ width, height: 568 });
+        const link = await save.boundingBox();
+        const paste = await page.locator("#paste-button").boundingBox();
+        const go = await download(page).boundingBox();
+        assert.ok(link.x + link.width <= paste.x && paste.x + paste.width <= go.x);
+        assert.ok(link.y >= paste.y && link.y + link.height <= paste.y + paste.height);
+        assert.equal(paste.y, go.y);
+    }
     const failure = context.waitForEvent("response", { predicate: r => r.url() === file.url });
     await save.click();
     assert.equal((await failure).status(), 502);
@@ -115,7 +124,7 @@ browserTest("direct downloads opt into provider links and keep tunnels available
     await enterLink(page);
     const submit = async expected => {
         await submitWithoutActivation(page);
-        await page.waitForFunction(href => !document.querySelector("#result").hidden
+        await page.waitForFunction(href => !document.querySelector("#save-file").hidden
             && document.querySelector("#save-file").href === href, expected);
     };
     await submit(file.url);

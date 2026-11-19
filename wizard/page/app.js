@@ -10,7 +10,6 @@ const form = $("form");
 const urlInput = $("url");
 const goButton = $("go-button");
 const statusField = $("status");
-const result = $("result");
 const saveFile = $("save-file");
 const picker = $("picker");
 const pickerList = $("picker-list");
@@ -295,7 +294,7 @@ updateFormatOptions();
 
 const prepareDownload = async (request) => {
     if (busy) return;
-    result.hidden = true;
+    saveFile.hidden = true;
     setBusy(true);
     setStatus("Connecting...");
     try {
@@ -305,7 +304,7 @@ const prepareDownload = async (request) => {
             case "redirect":
                 if (!picker.hidden) closePicker();
                 setSaveLink(saveFile, mediaURL(data.url), "This link expired. Choose Download to get a new link.");
-                result.hidden = false;
+                saveFile.hidden = false;
                 setStatus(data.filename ? `File ready: ${data.filename}` : "File ready. Select Save file.");
                 if (navigator.userActivation?.isActive) saveFile.click();
                 break;
@@ -344,7 +343,7 @@ refreshPicker.addEventListener("click", () => {
 });
 
 form.addEventListener("input", () => {
-    result.hidden = true;
+    saveFile.hidden = true;
 });
 
 $("paste-button").addEventListener("click", async () => {
@@ -352,7 +351,7 @@ $("paste-button").addEventListener("click", async () => {
         const text = await navigator.clipboard.readText();
         if (text && !busy) {
             urlInput.value = text.trim();
-            result.hidden = true;
+            saveFile.hidden = true;
         }
     } catch {
         urlInput.focus();

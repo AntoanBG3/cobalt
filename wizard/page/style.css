@@ -52,6 +52,10 @@ fieldset {
     margin-top: 12px;
 }
 
+#save-file {
+    margin-inline-end: auto;
+}
+
 .buttons button {
     min-width: 88px;
     min-height: 28px;
