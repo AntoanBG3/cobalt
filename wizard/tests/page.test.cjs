@@ -103,6 +103,31 @@ browserTest("a file handoff leaves the form and its recovery link in place", asy
     assert.equal(await save.isVisible(), true);
 });
 
+browserTest("direct downloads opt into provider links and keep tunnels available", async (page) => {
+    const source = "https://example.org/media.mp4";
+    const requests = [];
+    respond = (req, res, body) => {
+        if (req.method === "GET") return json(res, metadata);
+        requests.push(body.alwaysProxy);
+        const direct = !body.alwaysProxy && requests.length === 2;
+        return json(res, direct ? { status: "redirect", url: source } : file);
+    };
+    await enterLink(page);
+    const submit = async expected => {
+        await submitWithoutActivation(page);
+        await page.waitForFunction(href => !document.querySelector("#result").hidden
+            && document.querySelector("#save-file").href === href, expected);
+    };
+    await submit(file.url);
+    await page.locator('label[for="direct-download"]').click();
+    await submit(source);
+    await submit(file.url);
+    await page.locator('label[for="mode-captions"]').click();
+    assert.equal(await page.locator("#direct-options").isVisible(), false);
+    await submit(file.url);
+    assert.deepEqual(requests, [true, false, false, true]);
+});
+
 browserTest("a quick result still starts a download directly", async (page, context) => {
     respond = (req, res) => req.url === "/file" ? attachment(res)
         : json(res, req.method === "GET" ? metadata : file);
@@ -223,8 +248,10 @@ browserTest("errors wrap on narrow screens and Help fits and restores focus", as
     const dialog = page.getByRole("dialog");
     const bounds = await dialog.boundingBox();
     assert.ok(bounds.y >= 0 && bounds.y + bounds.height <= 240);
-    await page.keyboard.press("Tab");
     assert.equal(await dialog.evaluate(el => el.contains(document.activeElement)), true);
+    await page.keyboard.press("Tab");
+    // WebKit on macOS can move Tab focus to browser chrome.
+    assert.equal(await page.locator("#main-window").evaluate(el => el.contains(document.activeElement)), false);
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "hidden" });
     assert.equal(await help.evaluate(el => el === document.activeElement), true);
@@ -244,12 +271,12 @@ browserTest("audio and captions include only the selected format", async (page) 
     };
     await page.locator('label[for="mode-audio"]').click();
     await send();
-    await page.locator("#audio-format").selectOption("best");
+    await page.locator("#audio-format").selectOption("mp3");
     await send();
     await page.locator('label[for="mode-captions"]').click();
     await page.locator("#caption-format").selectOption("srt");
     await send();
     assert.deepEqual(sent.map(({ downloadMode, audioFormat, captionFormat }) => [downloadMode, audioFormat, captionFormat]), [
-        ["audio", "mp3", undefined], ["audio", "best", undefined], ["captions", undefined, "srt"],
+        ["audio", "best", undefined], ["audio", "mp3", undefined], ["captions", undefined, "srt"],
     ]);
 });

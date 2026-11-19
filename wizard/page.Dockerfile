@@ -16,4 +16,4 @@ COPY wizard/nginx.conf.template /etc/nginx/wizard.conf.template
 COPY --chmod=755 wizard/40-wizard-config.sh /docker-entrypoint.d/40-wizard-config.sh
 RUN chown -R nginx:nginx /usr/share/nginx/html /etc/nginx/conf.d
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD wget -q -O /dev/null http://127.0.0.1/config.js || exit 1
+    CMD wget -q -U wizard-healthcheck -O /dev/null http://127.0.0.1/config.js || exit 1

@@ -44,6 +44,11 @@ and on demand:
 | `ghcr.io/antoanbg3/cobalt-api:wizard` | upstream `main` + `patches/` |
 | `ghcr.io/antoanbg3/cobalt-page:wizard` | `page/` on nginx |
 
+The page uses wizard for downloads by default. The direct-download checkbox lets
+cobalt return a provider link when possible. Files that require server processing
+still use a tunnel. Audio mode defaults to **Best available** and also offers MP3.
+Nginx omits successful local page health checks from the access log.
+
 The workflow tests both images before publishing either. Releases have a versioned
 tag (`<version>-<upstream sha>-<fork sha>` for the API, the commit SHA for the page)
 as well as the moving `wizard` tag. Both images include an HTTP health check.

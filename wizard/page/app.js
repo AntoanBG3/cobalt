@@ -191,7 +191,6 @@ const requestMedia = async (request, retried = false) => {
             headers,
             body: JSON.stringify({
                 ...request,
-                alwaysProxy: true,
                 filenameStyle: "pretty",
                 videoQuality: "1080",
             }),
@@ -287,6 +286,7 @@ const updateFormatOptions = () => {
     const mode = selectedMode();
     captionOptions.hidden = captionFormat.disabled = mode !== "captions";
     audioOptions.hidden = audioFormat.disabled = mode !== "audio";
+    $("direct-options").hidden = mode === "captions";
 };
 
 form.addEventListener("change", updateFormatOptions);
@@ -333,6 +333,7 @@ form.addEventListener("submit", (event) => {
     prepareDownload({
         url,
         downloadMode: mode,
+        alwaysProxy: mode === "captions" || !$("direct-download").checked,
         ...(mode === "captions" && { captionFormat: captionFormat.value }),
         ...(mode === "audio" && { audioFormat: audioFormat.value }),
     });

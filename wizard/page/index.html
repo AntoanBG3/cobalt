@@ -58,9 +58,13 @@
                     <div class="field-row" id="audio-options" hidden>
                         <label for="audio-format">Format</label>
                         <select id="audio-format" disabled>
-                            <option value="mp3">MP3</option>
                             <option value="best">Best available (format varies)</option>
+                            <option value="mp3">MP3</option>
                         </select>
+                    </div>
+                    <div class="field-row" id="direct-options">
+                        <input id="direct-download" type="checkbox">
+                        <label for="direct-download">Download directly from the source when available</label>
                     </div>
                 </fieldset>
 
@@ -100,6 +104,7 @@
         <div class="window-body">
             <p>Paste a link to a post and press Download. If the download does not start, select Save file.</p>
             <p>For posts with several files, pick what to save. If a link expires, select Refresh list.</p>
+            <p>Direct downloads connect your browser to the source. If a link fails or opens a player, turn off direct downloads and try again.</p>
             <p>YouTube transcript saves existing captions as plain text or timed subtitles.</p>
             <p>Only save content you have the rights to.</p>
             <p>Powered by <a href="https://github.com/imputnet/cobalt" target="_blank" rel="noopener">cobalt</a> (AGPL-3.0) &middot; <a href="https://github.com/AntoanBG3/cobalt/tree/wizard/wizard" target="_blank" rel="noopener">source</a>.</p>
